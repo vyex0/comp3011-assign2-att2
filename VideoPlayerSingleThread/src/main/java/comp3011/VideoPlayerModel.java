@@ -4,7 +4,7 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Vanessa Soetjiadi, a1945309
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -15,6 +15,8 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -43,8 +45,13 @@ public class VideoPlayerModel {
     private static final long FIVE_SECONDS_US = 5_000_000L;
     private static final long AUDIO_LEAD_NS = 30_000_000L;
     
-    private static CommandLineController cmdController;
-
+    // Identifies the computer's available core, and creates (cores*2 - 2) threads from it. Don't
+    // really want to maximize the core's utilization.
+	private static final int EFFECTS_WORKER_COUNT = ((Runtime.getRuntime().availableProcessors()*2) - 2);
+	// Creates the effects worker thread pool that will be responsible for keeping
+	// track of all the working and idle threads.
+	private static final ExecutorService EFFECTS_WORKER_EXECUTORS = Executors.newFixedThreadPool(EFFECTS_WORKER_COUNT);
+	
     private final List<FrameProcessor> frameProcessors;
     private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();
     private final BiConsumer<Integer, Integer> videoSizeChangedHandler;
@@ -90,6 +97,9 @@ public class VideoPlayerModel {
     private long playbackStartNs;
     private long pauseStartedNs;
     private long relativeSeekBaseUs = NO_SEEK_REQUEST;
+    
+    // privateList<Pre>
+    private List<PreparedFrame> preparedFrames; // List of PreparedFrames completed by the EFFECTS_WORKER_THREAD
 
     public VideoPlayerModel(
             boolean audioEnabled,
