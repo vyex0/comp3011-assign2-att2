@@ -98,7 +98,7 @@ public class CommandLineController {
         } else if ("-j".equals(arg) || "--jitter-frames".equals(arg)) {
             frameProcessors.add(new FrameJitterer());
         } else if ("-m".equals(arg) || "--mottle-frames".equals(arg)) {
-            frameProcessors.add(new FrameFlickerer());
+            frameProcessors.add(new FrameMottler());
         } else if ("-b".equals(arg) || "--bleed-frames".equals(arg)) {
             frameProcessors.add(new FrameBleeder());
         } else if ("-p".equals(arg) || "--pepper-frames".equals(arg)) {
@@ -126,7 +126,6 @@ public class CommandLineController {
             } else if (arg.startsWith("--")) {
                 if (!handleOptions(arg)) {
                     errorMessage = "Unknown option: " + arg;
-                    return;
                 };
             } else if (arg.startsWith("-")) {
                 if (arg.length() > 2) {
@@ -137,16 +136,12 @@ public class CommandLineController {
 
                         if (!handleOptions(innerArg)) {
                             errorMessage = "Unknown option: " + arg;
-                            return;
                         }
-                        ;
                     }
                 } else {
                     if (!handleOptions(arg)) {
                         errorMessage = "Unknown option: " + arg;
-                        return;
                     }
-                    ;
                 }
             } else {
                 videoFiles.add(arg);

@@ -15,8 +15,12 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -98,8 +102,10 @@ public class VideoPlayerModel {
     private long pauseStartedNs;
     private long relativeSeekBaseUs = NO_SEEK_REQUEST;
     
-    // privateList<Pre>
     private List<PreparedFrame> preparedFrames; // List of PreparedFrames completed by the EFFECTS_WORKER_THREAD
+    // List of PreparedFrames fetched by the readNextVideoFrame(). ConcurrentLinkedQueue is used so several
+    // threads can run at the same time.
+    private final ConcurrentLinkedQueue<Future<PreparedFrame>> preparedFramesQueue = new ConcurrentLinkedQueue<Future<PreparedFrame>>();
 
     public VideoPlayerModel(
             boolean audioEnabled,
@@ -297,6 +303,11 @@ public class VideoPlayerModel {
         }
 
         try {
+//        	// Fetches the next set of frames to be prepared, prepares them and then chucks them into
+//        	// the preparedFramesQueue, where it can be fetched by the displayPreparedFrame()
+//        	while (preparedFramesQueue.size() < EFFECTS_WORKER_COUNT) {
+//        		preparedFramesQueue.offer(EFFECTS_WORKER_EXECUTORS.submit(() -> readNextVideoFrame()));
+//        	}
             preparedFrame = readNextVideoFrame();
         } catch (Exception e) {
             handlePlaybackError(e);
@@ -380,10 +391,24 @@ public class VideoPlayerModel {
         writeDueAudio(now);
 
         // Task (2)
+        // Fetches the next prepared frame that is available from preparedFramesQueue
+//        if (preparedFrame == null) {
+//        	Future<PreparedFrame> head = preparedFramesQueue.peek();
+//        	if (head != null && head.isDone()) {
+//        		preparedFramesQueue.poll();
+//        		try {
+//        			preparedFrame = head.get();
+//        		} catch (Exception e) {
+//        			handlePlaybackError(e); return;
+//        		}
+//        	}
+//        }
+        
         if (preparedFrame != null && preparedFrame.targetTimeNs() <= now) {
-            // We have a prepared frame ready to go and it is due (or just past due!) so get it up on screen ASAP!
+            // We have a prepared frame ready to go and it is due (or just past due!) so get it up on screen ASAP! 	
             displayPreparedFrame(now);
         }
+        
 
         // Task (3). We'll try and be nice to the GUI event loop here by queueing the prepareNextFrame call rather than
         // hogging the thread and doing it here, hence the tricky callback and use of prepareNextFrameQueued. Feel free
