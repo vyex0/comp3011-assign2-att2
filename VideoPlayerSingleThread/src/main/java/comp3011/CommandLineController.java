@@ -120,10 +120,26 @@ public class CommandLineController {
                 setDisplayId(1);
             } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
                 setDisplayId(2);
-            } else if (arg.startsWith("-") || arg.startsWith("--")) {
-                if (!handleOptions(arg)) {
+            } else if (arg.startsWith("--")) {
+            	if (!handleOptions(arg)) {
                     errorMessage = "Unknown option: " + arg; return;
                 };
+            } else if (arg.startsWith("-")) {
+            	if (arg.length() > 2) {
+                    for (int i = 1; i < arg.length(); i++) {
+                    	// For stacked options, they don't have "-" at the beginning 
+                    	// so "-" is added here.
+                    	String innerArg = "-" + arg.charAt(i); 
+
+                		if (!handleOptions(innerArg)) {
+                            errorMessage = "Unknown option: " + arg; return;
+                        };
+                	}
+            	} else {
+            		if (!handleOptions(arg)) {
+                        errorMessage = "Unknown option: " + arg; return;
+                    };
+            	}
             } else {
                 videoFiles.add(arg);
             }
