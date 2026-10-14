@@ -15,11 +15,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Created in the VideoPlayerApp's main function to receive and parse the video player's command-line arguments.
+ * Created in the VideoPlayerApp's main function to receive and parse the video
+ * player's command-line arguments.
  *
  * <p>
  * Extracts the video file and supported launch options, reports invalid input
- * or help text, and exposes the resulting launch configuration via methods to the
+ * or help text, and exposes the resulting launch configuration via methods to
+ * the
  * {@link VideoPlayerApp}.
  * </p>
  */
@@ -32,7 +34,8 @@ public class CommandLineController {
     private Integer displayId;
     private File videoFile;
     private String errorMessage;
-    private List<FrameProcessor> frameProcessors = new ArrayList<>(); // List of FrameProcessors to be passed to the VideoPlayerModel
+    private List<FrameProcessor> frameProcessors = new ArrayList<>(); // List of FrameProcessors to be passed to the
+                                                                      // VideoPlayerModel
 
     public CommandLineController(String[] args) {
         this.args = args.clone();
@@ -121,32 +124,33 @@ public class CommandLineController {
             } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
                 setDisplayId(2);
             } else if (arg.startsWith("--")) {
-            	if (!handleOptions(arg)) {
-                    errorMessage = "Unknown option: " + arg; return;
+                if (!handleOptions(arg)) {
+                    errorMessage = "Unknown option: " + arg;
+                    return;
                 };
             } else if (arg.startsWith("-")) {
-            	if (arg.length() > 2) {
+                if (arg.length() > 2) {
                     for (int i = 1; i < arg.length(); i++) {
-                    	// For stacked options, they don't have "-" at the beginning 
-                    	// so "-" is added here.
-                    	String innerArg = "-" + arg.charAt(i); 
+                        // For stacked options, they don't have "-" at the beginning
+                        // so "-" is added here.
+                        String innerArg = "-" + arg.charAt(i);
 
-                		if (!handleOptions(innerArg)) {
-                            errorMessage = "Unknown option: " + arg; return;
-                        };
-                	}
-            	} else {
-            		if (!handleOptions(arg)) {
-                        errorMessage = "Unknown option: " + arg; return;
-                    };
-            	}
+                        if (!handleOptions(innerArg)) {
+                            errorMessage = "Unknown option: " + arg;
+                            return;
+                        }
+                        ;
+                    }
+                } else {
+                    if (!handleOptions(arg)) {
+                        errorMessage = "Unknown option: " + arg;
+                        return;
+                    }
+                    ;
+                }
             } else {
                 videoFiles.add(arg);
             }
-        }
-
-        for (FrameProcessor frames : frameProcessors) {
-            System.out.println(frames);
         }
 
         if (videoFiles.size() > 1) {
@@ -181,7 +185,7 @@ public class CommandLineController {
         System.out.println("  -x, --maximise     Open the player maximised");
         System.out.println("  -1, --monitor-1    Open the player on display 1");
         System.out.println("  -2, --monitor-2    Open the player on display 2");
-        
+
         System.out.println("Frame processors:");
         System.out.println(" -n, --number-frames    Render the frame number onto each frame");
         System.out.println(" -s, --scratch-frames   Render vertical film scratches");

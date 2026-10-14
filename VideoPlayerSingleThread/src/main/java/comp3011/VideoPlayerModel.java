@@ -42,6 +42,8 @@ public class VideoPlayerModel {
     private static final long NO_SEEK_REQUEST = -1; // Sentinel value used when no seek position is active.
     private static final long FIVE_SECONDS_US = 5_000_000L;
     private static final long AUDIO_LEAD_NS = 30_000_000L;
+    
+    private static CommandLineController cmdController;
 
     private final List<FrameProcessor> frameProcessors;
     private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();
@@ -95,24 +97,16 @@ public class VideoPlayerModel {
             Consumer<Image> frameReadyHandler,
             Consumer<String> statusChangedHandler,
             BiConsumer<Boolean, Boolean> playbackStateChangedHandler,
-            Consumer<Boolean> audioOutputStateChangedHandler) {
+            Consumer<Boolean> audioOutputStateChangedHandler,
+            List<FrameProcessor> frameProcessors) {
         audioOutputEnabled = audioEnabled;
         this.videoSizeChangedHandler = videoSizeChangedHandler;
         this.frameReadyHandler = frameReadyHandler;
         this.statusChangedHandler = statusChangedHandler;
         this.playbackStateChangedHandler = playbackStateChangedHandler;
         this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
-        this.frameProcessors = new ArrayList<>();
-//        frameProcessors.add(new FrameBleeder());
-//        frameProcessors.add(new FrameScratcher());
-//        frameProcessors.add(new FrameDuster());
-//        frameProcessors.add(new FramePepperer());
-//        frameProcessors.add(new FrameBlackAndWhiter());
-//        frameProcessors.add(new FrameYellower());
-//        frameProcessors.add(new FrameVignetter());
-//        frameProcessors.add(new FrameFlickerer());
-//        frameProcessors.add(new FrameJitterer());
-//        frameProcessors.add(new FrameNumberer());
+        
+        this.frameProcessors = frameProcessors;
     }
 
     public void play(File file) {

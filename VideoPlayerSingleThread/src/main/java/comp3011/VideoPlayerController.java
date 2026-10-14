@@ -11,6 +11,7 @@
 package comp3011;
 
 import java.io.File;
+import java.util.List;
 import java.util.function.BiConsumer;
 
 import javafx.scene.Scene;
@@ -33,7 +34,8 @@ public class VideoPlayerController {
 
     public VideoPlayerController(
             boolean audioEnabled,
-            BiConsumer<Integer, Integer> videoSizeChangedHandler) {
+            BiConsumer<Integer, Integer> videoSizeChangedHandler,
+            List<FrameProcessor> frameProcessors) { // List of FrameProcessors from CommandLineController
         this.view = new VideoPlayerView();
         this.videoSizeChangedHandler = videoSizeChangedHandler;
         model = new VideoPlayerModel(
@@ -42,7 +44,8 @@ public class VideoPlayerController {
                 this::onFrameReady,
                 this::onStatusChanged,
                 this::onPlaybackStateChanged,
-                this::onAudioOutputStateChanged);
+                this::onAudioOutputStateChanged,
+                frameProcessors);
 
         view.getStartOverButton().setOnAction(_ -> startOver());
         view.getBackFiveButton().setOnAction(_ -> backFiveSeconds());
