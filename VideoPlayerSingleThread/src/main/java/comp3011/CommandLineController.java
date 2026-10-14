@@ -32,6 +32,7 @@ public class CommandLineController {
     private Integer displayId;
     private File videoFile;
     private String errorMessage;
+    private List<FrameProcessor> frameProcessors = new ArrayList<>(); // List of FrameProcessors to be passed to the VideoPlayerModel
 
     public CommandLineController(String[] args) {
         this.args = args.clone();
@@ -60,6 +61,10 @@ public class CommandLineController {
         return displayId;
     }
 
+    public List<FrameProcessor> getFrameProcessor() {
+        return frameProcessors;
+    }
+
     public boolean isAudioRequested() {
         return audioRequested;
     }
@@ -72,7 +77,7 @@ public class CommandLineController {
         return errorMessage == null && videoFile != null;
     }
 
-    private boolean handleOptions(String arg, List<FrameProcessor> frameProcessors) {
+    private boolean handleOptions(String arg) {
         if ("-n".equals(arg) || "--number-frames".equals(arg)) {
             frameProcessors.add(new FrameNumberer());
         } else if ("-s".equals(arg) || "--scratch-frames".equals(arg)) {
@@ -104,7 +109,6 @@ public class CommandLineController {
 
     private void parse() {
         List<String> videoFiles = new ArrayList<>();
-        List<FrameProcessor> frameProcessors = new ArrayList<>(); // List of frames to be passed to the VideoPlayerModel
         for (String arg : args) {
             if ("-h".equals(arg) || "--help".equals(arg)) {
                 helpRequested = true;
@@ -117,7 +121,7 @@ public class CommandLineController {
             } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
                 setDisplayId(2);
             } else if (arg.startsWith("-") || arg.startsWith("--")) {
-                if (!handleOptions(arg, frameProcessors)) {
+                if (!handleOptions(arg)) {
                     errorMessage = "Unknown option: " + arg; return;
                 };
             } else {
