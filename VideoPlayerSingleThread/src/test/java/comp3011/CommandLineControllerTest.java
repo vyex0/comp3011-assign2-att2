@@ -91,6 +91,29 @@ public class CommandLineControllerTest {
     assertInstanceOf(FrameDuster.class, processors.get(3));
     assertInstanceOf(FrameNumberer.class, processors.get(4));
   }
+  
+  @Test
+  void combinedOptionVersionsEqualEachOther () throws IOException {
+    File fakeMovie = tempDir.resolve("movies.mp4").toFile();
+    fakeMovie.createNewFile();
+
+    String[] options = "-jf --dust-frames -d --number-frames".split(" ");
+
+    String[] args = new String[options.length + 1];
+    System.arraycopy(options, 0, args, 0, options.length);
+    args[options.length] = fakeMovie.getPath();
+    
+    CommandLineController commandLineController = new CommandLineController(args);
+
+    List<FrameProcessor> processors = commandLineController.getFrameProcessor();
+
+    assertEquals(5, processors.size());
+    assertInstanceOf(FrameJitterer.class, processors.get(0));
+    assertInstanceOf(FrameFlickerer.class, processors.get(1));
+    assertInstanceOf(FrameDuster.class, processors.get(2));
+    assertInstanceOf(FrameDuster.class, processors.get(3));
+    assertInstanceOf(FrameNumberer.class, processors.get(4));
+  }
 
   /**
    * Tests the failing conditions for command line controllers
