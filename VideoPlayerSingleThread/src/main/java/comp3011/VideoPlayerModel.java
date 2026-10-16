@@ -49,12 +49,22 @@ public class VideoPlayerModel {
     private static final long FIVE_SECONDS_US = 5_000_000L;
     private static final long AUDIO_LEAD_NS = 30_000_000L;
     
-    // Identifies the computer's available core, and creates (cores*2 - 2) threads from it. Don't
-    // really want to maximize the core's utilization.
-	private static final int EFFECTS_WORKER_COUNT = ((Runtime.getRuntime().availableProcessors()*2) - 2);
+    // Identifies the computer's available core, and creates roughly (cores - 1) threads from it.
+	private static final int EFFECTS_WORKER_COUNT = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
 	// Creates the effects worker thread pool that will be responsible for keeping
 	// track of all the working and idle threads.
-	private static final ExecutorService EFFECTS_WORKER_EXECUTORS = Executors.newFixedThreadPool(EFFECTS_WORKER_COUNT);
+	private static final ExecutorService EFFECTS_WORKER_EXECUTORS = Executors.newFixedThreadPool(
+			EFFECTS_WORKER_COUNT,
+			runnable -> {
+	            Thread thread = new Thread(runnable, "effects-worker");
+	            thread.setDaemon(true);   // don't keep the JVM alive after the window closes
+	            return thread;
+	        });
+	
+	// Provides one converter per worker thread. Each worker reuses its own, so nothing is shared
+	// between threads and nothing is allocated per frame.
+	private static final ThreadLocal<JavaFXFrameConverter> WORKER_CONVERTER =
+			ThreadLocal.withInitial(JavaFXFrameConverter::new);
 	
     private final List<FrameProcessor> frameProcessors;
     private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();
@@ -102,7 +112,9 @@ public class VideoPlayerModel {
     private long pauseStartedNs;
     private long relativeSeekBaseUs = NO_SEEK_REQUEST;
     
-    private List<PreparedFrame> preparedFrames; // List of PreparedFrames completed by the EFFECTS_WORKER_THREAD
+    private boolean endOfStreamReached; // grabber returned null, but queued frames may still need showing
+    private boolean displayWhilePaused; // Lets exactly one frame appear after a seek while paused
+    
     // List of PreparedFrames fetched by the readNextVideoFrame(). ConcurrentLinkedQueue is used so several
     // threads can run at the same time.
     private final ConcurrentLinkedQueue<Future<PreparedFrame>> preparedFramesQueue = new ConcurrentLinkedQueue<Future<PreparedFrame>>();
@@ -182,6 +194,8 @@ public class VideoPlayerModel {
 
     public void stopPlayback() {
         closePlaybackResources();
+        clearPreparedFrames();
+        displayWhilePaused = true;
         currentTimestampUs = 0;
         pauseRequested = false;
         notifyStatusChanged("Stopped");
@@ -191,6 +205,7 @@ public class VideoPlayerModel {
 
     public void shutdown() {
         closePlaybackResources();
+        EFFECTS_WORKER_EXECUTORS.shutdownNow();
     }
 
     private void seekRelative(long offsetUs) {
@@ -296,30 +311,46 @@ public class VideoPlayerModel {
         }
         pauseStartedNs = 0;
     }
+    
+    private void clearPreparedFrames() {
+    	for (Future<PreparedFrame> frames : preparedFramesQueue) {
+    		frames.cancel(true);
+    	}
+    	
+    	preparedFramesQueue.clear();
+    	preparedFrame = null;
+    	endOfStreamReached = false;
+    }
 
     private void prepareNextFrame() {
-        if (!playbackOpen || preparedFrame != null) {
+        if (!playbackOpen || endOfStreamReached) {
             return;
         }
 
         try {
-//        	// Fetches the next set of frames to be prepared, prepares them and then chucks them into
-//        	// the preparedFramesQueue, where it can be fetched by the displayPreparedFrame()
-//        	while (preparedFramesQueue.size() < EFFECTS_WORKER_COUNT) {
-//        		preparedFramesQueue.offer(EFFECTS_WORKER_EXECUTORS.submit(() -> readNextVideoFrame()));
-//        	}
-            preparedFrame = readNextVideoFrame();
+        	// Fetches the next set of frames to be prepared, prepares them and then chucks them into
+        	// the preparedFramesQueue, where it can be fetched by the displayPreparedFrame()
+        	while (preparedFramesQueue.size() < EFFECTS_WORKER_COUNT) {
+        		Future<PreparedFrame> next = readNextVideoFrame();
+        		if (next == null) {
+        			break; // end of video
+        		}
+        		
+        		preparedFramesQueue.offer(next);
+        	}
+            // preparedFrame = readNextVideoFrame();
         } catch (Exception e) {
             handlePlaybackError(e);
         }
     }
 
-    private PreparedFrame readNextVideoFrame() throws Exception {
+    // Modified to grab one picture frame and hand the effect work to a worker.
+    private Future<PreparedFrame> readNextVideoFrame() throws Exception {
         while (playbackOpen) {
             Frame frame = grabFrame();
             if (frame == null) {
-                finishPlayback();
-                return null;
+            	endOfStreamReached = true; // don't finish yet, some frames might still in flight
+            	return null;
             }
 
             long timestampUs = grabber.getTimestamp();
@@ -357,22 +388,22 @@ public class VideoPlayerModel {
 
             int frameNumber = grabber.getFrameNumber();
             InfoFrame info = new InfoFrame(frameNumber, timestampUs);
-            processFrame(frame, info);
-
-            Image image = converter.convert(frame);
+            
             long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
             long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
             long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
-
-            return new PreparedFrame(
-                    image,
-                    frameNumber,
-                    timestampUs,
-                    logicalTimestampUs,
-                    targetTimeNs,
-                    System.nanoTime());
+            
+            Frame copy = frame.clone();
+            
+            return EFFECTS_WORKER_EXECUTORS.submit(() -> {
+            	processFrame(copy, info);
+            	// Each worker thread is modified to use their own converter instead 
+            	// of creating a new one for every frame.
+            	Image image = WORKER_CONVERTER.get().convert(copy);
+        		return new PreparedFrame(image, frameNumber, timestampUs, logicalTimestampUs, targetTimeNs, System.nanoTime());
+            });
         }
-
+        
         return null;
     }
 
@@ -391,22 +422,37 @@ public class VideoPlayerModel {
         writeDueAudio(now);
 
         // Task (2)
-        // Fetches the next prepared frame that is available from preparedFramesQueue
-//        if (preparedFrame == null) {
-//        	Future<PreparedFrame> head = preparedFramesQueue.peek();
-//        	if (head != null && head.isDone()) {
-//        		preparedFramesQueue.poll();
-//        		try {
-//        			preparedFrame = head.get();
-//        		} catch (Exception e) {
-//        			handlePlaybackError(e); return;
-//        		}
-//        	}
-//        }
-        
         if (preparedFrame != null && preparedFrame.targetTimeNs() <= now) {
             // We have a prepared frame ready to go and it is due (or just past due!) so get it up on screen ASAP! 	
             displayPreparedFrame(now);
+        }
+        
+        if (!pauseRequested || displayWhilePaused) {
+        	if (preparedFrame == null) {
+        		Future<PreparedFrame> head = preparedFramesQueue.peek();
+        		if (head != null && head.isDone()) {
+        			preparedFramesQueue.poll();
+        			try {
+        				preparedFrame = head.get();
+        			} catch (Exception e) {
+        				handlePlaybackError(e); return;
+        			}
+        		}
+        	}
+        	
+        	if (preparedFrame != null) {
+        		// Due time is computed now, not at prepare time, so a pause/resume shifts every queued frame.
+        		long relativeUs = Math.max(0, preparedFrame.mediaTimestampUs() - firstTimestampUs);
+                long dueNs = playbackStartNs + relativeUs * 1_000L;
+                if (dueNs <= now) {
+                    displayPreparedFrame(now);
+                }
+        	}
+        }
+        
+        // Everything grabbed and shown: now it's safe to finish.
+        if (endOfStreamReached && preparedFrame == null && preparedFramesQueue.isEmpty()) {
+            finishPlayback(); return;
         }
         
 
@@ -415,7 +461,8 @@ public class VideoPlayerModel {
         // to replace this whole block with simple linear control flow logic
         // such as: if (!pauseRequested && preparedFrame == null) prepareNextFrame();
         // to compare.
-        if (!pauseRequested && preparedFrame == null && !prepareNextFrameQueued) {
+        if (!pauseRequested && preparedFrame == null && !prepareNextFrameQueued
+        		&& preparedFramesQueue.size() < EFFECTS_WORKER_COUNT) {
             prepareNextFrameQueued = true;
             Platform.runLater(() -> {
                 prepareNextFrameQueued = false;
