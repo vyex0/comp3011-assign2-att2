@@ -52,7 +52,7 @@ public class VideoPlayerModel {
     private static final long AUDIO_LEAD_NS = 30_000_000L;
     
     // Identifies the computer's available core, and creates roughly (cores - 1) threads from it.
-	private static final int EFFECTS_WORKER_COUNT = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
+	private static final int EFFECTS_WORKER_COUNT = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
 	
 	/**
 	 * Creates a thread factory that names each thread and marks it as a daemon thread (daemon threads
@@ -574,9 +574,27 @@ public class VideoPlayerModel {
 
         notifyFrameReady(frame.image());
     }
+    /**
+     * Called on the decoder thread. Copies the audio from a decoded frame and adds
+     * it to pendingAudio for the JavaFX thread to play.
+     *
+     * Deliberately does NOT check audioOutputEnabled. Audio is always queued, and
+     * writeDueAudio() decides whether to play or discard each chunk when it comes
+     * due. That keeps this method free of mute logic, and means unmuting resumes
+     * sound immediately from the correct position, because the upcoming chunks are
+     * already queued.
+     */
 
+    /**
+     * Called on the decoder thread. Copies the audio from a decoded frame and adds it to
+     * pendingAudio for the JavaFX thread to play. 
+     * 
+     * audioOutputEnabled check is removed so that audio is ALWAYS queued, and let 
+     * writeDueAudio() decides whether to play or discard each chunk when it comes due.
+     * Which means unmuting resumes sound immediately from the correct position.
+     */
     private void queueAudio(long timestampUs, Frame frame) {
-        if (!audioOutputEnabled || audioPlayer == null) {
+        if (audioPlayer == null) {
             return;
         }
 
@@ -586,31 +604,46 @@ public class VideoPlayerModel {
         }
     }
 
+    /**
+     * Called on the JavaFX thread by the heartbeat. Writes any queued audio that is due
+     * to the audio player, or discards it when audio output is disabled.
+     */
     private void writeDueAudio(long now) {
+    	// Snapshot the clock under the lock so both values come from the same consistent state.
     	long first, start;
     	synchronized (clockLock) { first = firstTimestampUs; start = playbackStartNs; }
     	
-        // Handle some obvious early exits
-        if (!audioOutputEnabled || audioPlayer == null) {
-            pendingAudio.clear();
-            return;
+    	// No audio device: nothing can ever be played, so drop whatever is queued.
+        if (audioPlayer == null) {
+            pendingAudio.clear(); return;
         }
+        
+        // Nothing is due while paused or before the first frame has set the clock anchor.
         if (pauseRequested || first == NO_SEEK_REQUEST || start <= 0) {
     	    return;
     	}
-
-        // Here is the real time dependent logic
-        // long dueTimestampUs = firstTimestampUs + (now + AUDIO_LEAD_NS - playbackStartNs) / 1_000L;
+        
+        // Timestamp to which audio should have been played by now, including small lead
+        // so audio device never runs dry.
         long dueTimestampUs = first + (now + AUDIO_LEAD_NS - start) / 1_000L;
+        
+        
         while (!pendingAudio.isEmpty()) {
             PendingAudio audio = pendingAudio.peek();
             if (audio.timestampUs() > dueTimestampUs) {
                 return;
             }
+            
+            // When muted: discards each chunk as it comes due, this keeps the queue current
+            // and keeps position correct when the user unmutes.
+            if (!audioOutputEnabled) {
+                pendingAudio.remove();
+                continue;
+            }
 
             int written = audioPlayer.write(audio.samples(), audio.offset(), audio.remaining());
             if (written <= 0) {
-                return;
+                return; // device buffer is full; try again next heartbeat
             }
 
             audio.advance(written);
