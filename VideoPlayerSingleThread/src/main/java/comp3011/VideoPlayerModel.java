@@ -16,11 +16,17 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -51,23 +57,51 @@ public class VideoPlayerModel {
     
     // Identifies the computer's available core, and creates roughly (cores - 1) threads from it.
 	private static final int EFFECTS_WORKER_COUNT = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
-	// Creates the effects worker thread pool that will be responsible for keeping
-	// track of all the working and idle threads.
-	private static final ExecutorService EFFECTS_WORKER_EXECUTORS = Executors.newFixedThreadPool(
-			EFFECTS_WORKER_COUNT,
-			runnable -> {
-	            Thread thread = new Thread(runnable, "effects-worker");
-	            thread.setDaemon(true);   // don't keep the JVM alive after the window closes
-	            return thread;
-	        });
+	
+	/**
+	 * Creates a thread factory that names each thread and marks it as a daemon thread (daemon threads
+	 * don't keep the JVM alive, so the app can exit when the JavaFX window closes even when the pool
+	 * hasn't been shut down).
+	 */
+	private static ThreadFactory daemonThreads(String name) {
+		// Used to keep track of the number of different effect worker threads.
+		AtomicInteger count = new AtomicInteger();
+		return runnable -> {
+			Thread thread = new Thread(runnable, name + "-" + count.incrementAndGet());
+			thread.setDaemon(true);
+			return thread;
+		};
+	}
+	
+	// Creates the effect workers thread pool that is responsible for applying effects to the frames.
+	private static final ExecutorService EFFECTS_WORKERS = 
+			Executors.newFixedThreadPool(EFFECTS_WORKER_COUNT, daemonThreads("effects-worker"));
+	
+	// Decoded thread that owns the FFmpeg grabber and is the only one that calls grab() during playback.
+	// The graber isn't thread safe, so decoding is confined to this thread.
+	private static final ExecutorService DECODER = 
+			Executors.newSingleThreadExecutor(daemonThreads("decoder"));
 	
 	// Provides one converter per worker thread. Each worker reuses its own, so nothing is shared
 	// between threads and nothing is allocated per frame.
 	private static final ThreadLocal<JavaFXFrameConverter> WORKER_CONVERTER =
 			ThreadLocal.withInitial(JavaFXFrameConverter::new);
 	
+	// How many frames can be decoded but not yet displayed. It is made WORKER_COUNT + 2 so that
+	// the wokers are kept busy.
+	private static final int MAX_FRAMES_IN_FLIGHT = EFFECTS_WORKER_COUNT + 2;
+	
+	/**
+	 * Guards the playback clocks: firstTimestampUs, logicalPlaybackBaseUs, playbackStartNs and pauseStartedNs.
+	 * These fields are written by the decoder thread, and the JavaFX thread. Every read or write must happen
+	 * inside synchronized (clockLock) so no thread ever sees a  half-updated clock.
+	 */
+	private final Object clockLock = new Object();
+	
     private final List<FrameProcessor> frameProcessors;
-    private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();
+    // Modified to use ConcurrentLinkedQueue because ArrayDeque is not thread safe for concurrent
+    // add/poll of elements. Decoder thread adds audio, GUI thread drains it.
+    private final Queue<PendingAudio> pendingAudio = new ConcurrentLinkedQueue<>();
     private final BiConsumer<Integer, Integer> videoSizeChangedHandler;
     private final Consumer<Image> frameReadyHandler;
     private final Consumer<String> statusChangedHandler;
@@ -95,9 +129,10 @@ public class VideoPlayerModel {
     private AudioPlayer audioPlayer; // This is ours. It has some real time buffering smarts.
     private PreparedFrame preparedFrame; // Ours, but is just an Image with some meta-data added.
     private boolean prepareNextFrameQueued; // True only when the event loop needs to call our prepareNextFrame method.
-    private boolean playbackOpen; // True when playback is happening.
-    private boolean pauseRequested;
-    private boolean audioOutputEnabled;
+    // Made to be volatile to guarantee that decoder sees change immediately instead of using stale cached value. 
+    private volatile boolean playbackOpen; // True when playback is happening.
+    private volatile boolean pauseRequested;
+    private volatile boolean audioOutputEnabled;
     private boolean audioAvailable;
     private boolean frameProcessorsInitialised;
     private long currentTimestampUs;
@@ -112,8 +147,19 @@ public class VideoPlayerModel {
     private long pauseStartedNs;
     private long relativeSeekBaseUs = NO_SEEK_REQUEST;
     
-    private boolean endOfStreamReached; // grabber returned null, but queued frames may still need showing
+    private volatile boolean endOfStreamReached; // grabber returned null, but queued frames may still need showing
     private boolean displayWhilePaused; // Lets exactly one frame appear after a seek while paused
+    
+    
+    /**
+     * Bumped every time the decoder must be stopped (e.g., pause, seek, restart) and old work (frames in
+     * prepareNextFrameQueued). Each decode loops and effects task remembers the value it started under 
+     * and abandon its work if the current generation value has changed. A counter is used instead of a
+     * boolean because a stale task may wake up long after the reset: a flag would already be back to
+     * 'valid' by then, whereas an old number can never match again.
+     */
+    private final AtomicInteger generation = new AtomicInteger();
+    private final AtomicBoolean decodeScheduled = new AtomicBoolean(); // Marks whether a decoding job is running or not.
     
     // List of PreparedFrames fetched by the readNextVideoFrame(). ConcurrentLinkedQueue is used so several
     // threads can run at the same time.
@@ -172,7 +218,7 @@ public class VideoPlayerModel {
         relativeSeekBaseUs = NO_SEEK_REQUEST;
 
         if (pauseRequested) {
-            pauseStartedNs = System.nanoTime();
+        	synchronized (clockLock) { pauseStartedNs = System.nanoTime(); }
             flushAudioOutput();
         } else {
             resumePlaybackClock(System.nanoTime());
@@ -194,7 +240,6 @@ public class VideoPlayerModel {
 
     public void stopPlayback() {
         closePlaybackResources();
-        clearPreparedFrames();
         displayWhilePaused = true;
         currentTimestampUs = 0;
         pauseRequested = false;
@@ -204,8 +249,9 @@ public class VideoPlayerModel {
     }
 
     public void shutdown() {
-        closePlaybackResources();
-        EFFECTS_WORKER_EXECUTORS.shutdownNow();
+        closePlaybackResources();	// this uses DECODER, so shut it down after
+        DECODER.shutdownNow();
+        EFFECTS_WORKERS.shutdownNow();
     }
 
     private void seekRelative(long offsetUs) {
@@ -229,10 +275,11 @@ public class VideoPlayerModel {
         }
 
         try {
+        	stopDecoder();                          // first: nobody else may touch the grabber now
             grabber.setTimestamp(grabTimestampUs);
             resetPlaybackClock(logicalTimestampUs);
             flushAudioOutput();
-            prepareNextFrame();
+            requestDecoding();
             notifyPlaybackStateChanged();
         } catch (Exception e) {
             handlePlaybackError(e);
@@ -255,7 +302,7 @@ public class VideoPlayerModel {
             resetPlaybackClock(currentTimestampUs);
             playbackOpen = true;
             playbackTimer.start();
-            prepareNextFrame();
+            requestDecoding();
             notifyPlaybackStateChanged();
         } catch (Exception e) {
             handlePlaybackError(e);
@@ -294,22 +341,88 @@ public class VideoPlayerModel {
         }
     }
 
+    // Resets the playback clock so the next decoded frame becomes the new time-zero anchor at the given
+    // position. Called on a seek (and when playback is restarted). Runs in the JavaFX thread, after 
+    // stopDecoder, so the decoder is idle, and no old frames are still being produced.
     private void resetPlaybackClock(long logicalTimestampUs) {
         pendingAudio.clear();
         preparedFrame = null;
         currentTimestampUs = logicalTimestampUs;
         relativeSeekBaseUs = logicalTimestampUs;
-        firstTimestampUs = NO_SEEK_REQUEST;
-        logicalPlaybackBaseUs = logicalTimestampUs;
-        playbackStartNs = 0;
-        pauseStartedNs = pauseRequested ? System.nanoTime() : 0;
+        synchronized (clockLock) {
+            firstTimestampUs = NO_SEEK_REQUEST;
+            logicalPlaybackBaseUs = logicalTimestampUs;
+            playbackStartNs = 0;
+            pauseStartedNs = pauseRequested ? System.nanoTime() : 0;
+        }
     }
 
+    // Shifts the playback clock forward by the length of a pause so that playback resumes where it left
+    // off instead of jumping ahead. Called on the JavaFX thread when the user resumes.
     private void resumePlaybackClock(long now) {
-        if (pauseStartedNs > 0 && playbackStartNs > 0) {
-            playbackStartNs += now - pauseStartedNs;
+    	synchronized (clockLock) {
+            if (pauseStartedNs > 0 && playbackStartNs > 0) {
+                playbackStartNs += now - pauseStartedNs;
+            }
+            pauseStartedNs = 0;
         }
-        pauseStartedNs = 0;
+    }
+    
+    /**
+     * Asks the decoder to decode more frames in the preparedFramesQueue. It is called repeatedly
+     * on every heartbeat and returns if the queue is full. The decodeScheduled ensures at most
+     * one decode job exists at a time.
+     */
+    private void requestDecoding() {
+    	if (!playbackOpen || endOfStreamReached
+    			|| preparedFramesQueue.size() >= MAX_FRAMES_IN_FLIGHT
+    			|| !decodeScheduled.compareAndSet(false, true)) {
+    		return;
+    	}
+    	int gen = generation.get();
+    	DECODER.execute(() -> decodeLoop(gen));
+    }
+    
+    /**
+     * Runs on the decoder thread. Reads frames and hands each one to an effects worker until the
+     * queue is full, the stream ends, or this job becomes stale.
+     */
+    private void decodeLoop(int gen) {
+    	try { // Rechecks at every iteration 
+    		while (gen == generation.get() && playbackOpen && !endOfStreamReached
+                    && preparedFramesQueue.size() < MAX_FRAMES_IN_FLIGHT) {
+    			// Grabs one frame, submits it to the worker, and queues the future, so the decoder
+    			// can move on while the worker is still processing.
+    			Future<PreparedFrame> next = readNextVideoFrame(gen);
+    			if (next == null) {
+    				break;
+    			}
+    			preparedFramesQueue.offer(next);
+    		}
+    	} catch (Exception e) {
+    		Platform.runLater(() -> {
+                if (gen == generation.get()) {
+                    handlePlaybackError(e);
+                }
+            });
+    	} finally {
+    		decodeScheduled.set(false);
+    	}
+    }
+    
+    /**
+     * Stops the decoder, waits until it's idle, and discards every queued frame. Only called from the JavaFX thread.
+     */
+    private void stopDecoder() {
+    	generation.incrementAndGet(); // 1. decoder loop and queued effects tasks now see they're stale
+    	try {
+    		DECODER.submit(() -> { }).get(); // 2. runs after any in-progress decode, so it is a barrier
+    	} catch (InterruptedException e) {
+    		Thread.currentThread().interrupt();
+    	} catch (ExecutionException | RejectedExecutionException e) {
+    		// Executor already shut down; nothing left to wait for.
+    	}
+    	clearPreparedFrames(); // 3. now nothing can add to the queue behind our back
     }
     
     private void clearPreparedFrames() {
@@ -322,31 +435,9 @@ public class VideoPlayerModel {
     	endOfStreamReached = false;
     }
 
-    private void prepareNextFrame() {
-        if (!playbackOpen || endOfStreamReached) {
-            return;
-        }
-
-        try {
-        	// Fetches the next set of frames to be prepared, prepares them and then chucks them into
-        	// the preparedFramesQueue, where it can be fetched by the displayPreparedFrame()
-        	while (preparedFramesQueue.size() < EFFECTS_WORKER_COUNT) {
-        		Future<PreparedFrame> next = readNextVideoFrame();
-        		if (next == null) {
-        			break; // end of video
-        		}
-        		
-        		preparedFramesQueue.offer(next);
-        	}
-            // preparedFrame = readNextVideoFrame();
-        } catch (Exception e) {
-            handlePlaybackError(e);
-        }
-    }
-
     // Modified to grab one picture frame and hand the effect work to a worker.
-    private Future<PreparedFrame> readNextVideoFrame() throws Exception {
-        while (playbackOpen) {
+    private Future<PreparedFrame> readNextVideoFrame(int gen) throws Exception {
+        while (playbackOpen && gen == generation.get()) {
             Frame frame = grabFrame();
             if (frame == null) {
             	endOfStreamReached = true; // don't finish yet, some frames might still in flight
@@ -378,29 +469,43 @@ public class VideoPlayerModel {
                 frameProcessorsInitialised = true;
             }
 
-            if (firstTimestampUs == NO_SEEK_REQUEST) {
-                firstTimestampUs = timestampUs;
-                playbackStartNs = System.nanoTime();
-                if (pauseRequested) {
-                    pauseStartedNs = playbackStartNs;
+//            if (firstTimestampUs == NO_SEEK_REQUEST) {
+//                firstTimestampUs = timestampUs;
+//                playbackStartNs = System.nanoTime();
+//                if (pauseRequested) {
+//                    pauseStartedNs = playbackStartNs;
+//                }
+//            }
+            
+            final long logicalTimestampUs;
+            final long targetTimeNs;
+            synchronized (clockLock) {
+            	if (firstTimestampUs == NO_SEEK_REQUEST) {
+                    firstTimestampUs = timestampUs;
+                    playbackStartNs = System.nanoTime();
+                    if (pauseRequested) {
+                        pauseStartedNs = playbackStartNs;
+                    }
                 }
+                long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
+                logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
+                targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
             }
-
+            
             int frameNumber = grabber.getFrameNumber();
             InfoFrame info = new InfoFrame(frameNumber, timestampUs);
-            
-            long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
-            long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
-            long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
-            
             Frame copy = frame.clone();
             
-            return EFFECTS_WORKER_EXECUTORS.submit(() -> {
+            return EFFECTS_WORKERS.submit(() -> {
+            	if (gen != generation.get()) {
+            		throw new CancellationException("stale frame from before a seek/stop");
+            	}
             	processFrame(copy, info);
             	// Each worker thread is modified to use their own converter instead 
             	// of creating a new one for every frame.
             	Image image = WORKER_CONVERTER.get().convert(copy);
-        		return new PreparedFrame(image, frameNumber, timestampUs, logicalTimestampUs, targetTimeNs, System.nanoTime());
+        		return new PreparedFrame(image, frameNumber, timestampUs, 
+        				logicalTimestampUs, targetTimeNs, System.nanoTime());
             });
         }
         
@@ -421,40 +526,30 @@ public class VideoPlayerModel {
         // Task (1)
         writeDueAudio(now);
 
-        // Task (2)
-        if (preparedFrame != null && preparedFrame.targetTimeNs() <= now) {
-            // We have a prepared frame ready to go and it is due (or just past due!) so get it up on screen ASAP! 	
-            displayPreparedFrame(now);
-        }
-        
+        // Task (2): show the next frame if it's due. The due time is computed from the live clock,
+        // so a pause/resume shifts every queued frame.
         if (!pauseRequested || displayWhilePaused) {
-        	if (preparedFrame == null) {
-        		Future<PreparedFrame> head = preparedFramesQueue.peek();
-        		if (head != null && head.isDone()) {
-        			preparedFramesQueue.poll();
-        			try {
-        				preparedFrame = head.get();
-        			} catch (Exception e) {
-        				handlePlaybackError(e); return;
-        			}
-        		}
-        	}
-        	
-        	if (preparedFrame != null) {
-        		// Due time is computed now, not at prepare time, so a pause/resume shifts every queued frame.
-        		long relativeUs = Math.max(0, preparedFrame.mediaTimestampUs() - firstTimestampUs);
-                long dueNs = playbackStartNs + relativeUs * 1_000L;
-                if (dueNs <= now) {
-                    displayPreparedFrame(now);
+            if (preparedFrame == null) {
+                Future<PreparedFrame> head = preparedFramesQueue.peek();
+                if (head != null && head.isDone()) {
+                    preparedFramesQueue.poll();
+                    try {
+                        preparedFrame = head.get();
+                    } catch (Exception e) {
+                        handlePlaybackError(e);
+                        return;
+                    }
                 }
-        	}
+            }
+            if (preparedFrame != null && dueTimeNs(preparedFrame.mediaTimestampUs()) <= now) {
+                displayPreparedFrame(now);
+            }
         }
         
         // Everything grabbed and shown: now it's safe to finish.
         if (endOfStreamReached && preparedFrame == null && preparedFramesQueue.isEmpty()) {
             finishPlayback(); return;
         }
-        
 
         // Task (3). We'll try and be nice to the GUI event loop here by queueing the prepareNextFrame call rather than
         // hogging the thread and doing it here, hence the tricky callback and use of prepareNextFrameQueued. Feel free
@@ -468,7 +563,7 @@ public class VideoPlayerModel {
                 prepareNextFrameQueued = false;
 
                 if (!pauseRequested) {
-                    prepareNextFrame();
+                	requestDecoding();
                 }
             });
         }
@@ -509,17 +604,21 @@ public class VideoPlayerModel {
     }
 
     private void writeDueAudio(long now) {
+    	long first, start;
+    	synchronized (clockLock) { first = firstTimestampUs; start = playbackStartNs; }
+    	
         // Handle some obvious early exits
         if (!audioOutputEnabled || audioPlayer == null) {
             pendingAudio.clear();
             return;
         }
-        if (pauseRequested || firstTimestampUs == NO_SEEK_REQUEST || playbackStartNs <= 0) {
-            return;
-        }
+        if (pauseRequested || first == NO_SEEK_REQUEST || start <= 0) {
+    	    return;
+    	}
 
         // Here is the real time dependent logic
-        long dueTimestampUs = firstTimestampUs + (now + AUDIO_LEAD_NS - playbackStartNs) / 1_000L;
+        // long dueTimestampUs = firstTimestampUs + (now + AUDIO_LEAD_NS - playbackStartNs) / 1_000L;
+        long dueTimestampUs = first + (now + AUDIO_LEAD_NS - start) / 1_000L;
         while (!pendingAudio.isEmpty()) {
             PendingAudio audio = pendingAudio.peek();
             if (audio.timestampUs() > dueTimestampUs) {
@@ -562,19 +661,26 @@ public class VideoPlayerModel {
 
     private void closePlaybackResources() {
         playbackTimer.stop();
-        playbackOpen = false;
-        preparedFrame = null;
+        playbackOpen = false; // 1. tell the decoder loop to stop
+        stopDecoder();		  // 2. wait until it's idle. MUST happen before the grabber is closed
         pendingAudio.clear();
-        firstTimestampUs = NO_SEEK_REQUEST;
-        playbackStartNs = 0;
-        pauseStartedNs = 0;
+        clearPlaybackClock();
         audioAvailable = false;
         frameProcessorsInitialised = false;
+//        preparedFrame = null;	
+//        pendingAudio.clear();
+//        firstTimestampUs = NO_SEEK_REQUEST;
+//        playbackStartNs = 0;
+//        pauseStartedNs = 0;
+//        audioAvailable = false;
+//        frameProcessorsInitialised = false;
 
-        if (audioPlayer != null) {
-            audioPlayer.close();
-            audioPlayer = null;
-        }
+//        if (audioPlayer != null) {
+//            audioPlayer.close();
+//            audioPlayer = null;
+//        }
+        
+        if (audioPlayer != null) { audioPlayer.close(); audioPlayer = null; }
 
         if (grabber != null) {
             try {
@@ -626,6 +732,31 @@ public class VideoPlayerModel {
         }
 
         return Math.max(0, durationUs - frameDurationUs);
+    }
+    
+    /**
+     * Returns a wall-clock time at which the frame with the given media timsestamp is due
+     * on scree: the anchor's start time plus the frame's offset from the anchor. Reads the clock
+     * under clockLock so the two fields are always from the same consistent state.
+     */
+    private long dueTimeNs(long mediaTimestampUs) {
+        synchronized (clockLock) {
+            long relativeUs = Math.max(0, mediaTimestampUs - firstTimestampUs);
+            return playbackStartNs + relativeUs * 1_000L;
+        }
+    }
+    
+    /**
+     * Clears the playback clock when playback is closed, so a later restart doesn't inherit
+     * stale timing. Fields are cleared together under clockLock so the decoder never sees a
+     * partial reset.
+     */
+    private void clearPlaybackClock() {
+        synchronized (clockLock) {
+            firstTimestampUs = NO_SEEK_REQUEST;
+            playbackStartNs = 0;
+            pauseStartedNs = 0;
+        }
     }
 
     private void processFrame(Frame frame, InfoFrame info) throws Exception {
