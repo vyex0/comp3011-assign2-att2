@@ -574,16 +574,6 @@ public class VideoPlayerModel {
 
         notifyFrameReady(frame.image());
     }
-    /**
-     * Called on the decoder thread. Copies the audio from a decoded frame and adds
-     * it to pendingAudio for the JavaFX thread to play.
-     *
-     * Deliberately does NOT check audioOutputEnabled. Audio is always queued, and
-     * writeDueAudio() decides whether to play or discard each chunk when it comes
-     * due. That keeps this method free of mute logic, and means unmuting resumes
-     * sound immediately from the correct position, because the upcoming chunks are
-     * already queued.
-     */
 
     /**
      * Called on the decoder thread. Copies the audio from a decoded frame and adds it to
@@ -700,11 +690,6 @@ public class VideoPlayerModel {
             }
             grabber = null;
         }
-
-//        if (converter != null) {
-//            converter.close();
-//            converter = null;
-//        }
     }
 
     private String mediaName(File file) {

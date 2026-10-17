@@ -4,7 +4,7 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Vanessa Soetjiadi, a1945309
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -21,9 +21,9 @@ import org.bytedeco.javacv.Frame;
  * effect still looks okay.
  *
  * <p>
- * Initialisation builds multi-scale noise fields and colour lookup tables.
+ * Initialisation builds multi-scale noise fields and colour lookup tables.f
  * {@link #process(Frame, InfoFrame)} samples those fields in image blocks and
- * applies the selected channel scales through {@link #applyMottleBlock(ByteBuffer, int, int, int, int, int, int)}.
+ * applies the selected channel scales through {@link #applyMottleBlock(ByteBuffer, int, int, int, int, int, int, BlockIndices)}.
  * </p>
  */
 public class FrameMottler extends FrameProcessor {
@@ -58,9 +58,6 @@ public class FrameMottler extends FrameProcessor {
 
     private final int instanceIndex;
     private int mediaSeed;
-    private int cachedDamageMaskSegment = Integer.MIN_VALUE;
-    private double[] damageMaskA;
-    private double[] damageMaskB;
     private int[] xGridLeft;
     private double[] xGridBlend;
     private int[] yGridTop;
@@ -68,9 +65,10 @@ public class FrameMottler extends FrameProcessor {
     private byte[][] scaleLookups;
     private double minimumScale;
     private double maximumScale;
-    private int blockBlueScaleIndex;
-    private int blockGreenScaleIndex;
-    private int blockRedScaleIndex;
+    
+    // Replaces cachedDamageMaskSegment, damageMaskA and damageMaskB. Mutable state shared between workers,
+    // it's volatile so a snapshot published by one worker is fully visible to the others.
+    private volatile DamageMaskPair damageMasks;
 
     public FrameMottler() {
         super();
@@ -83,6 +81,7 @@ public class FrameMottler extends FrameProcessor {
         mediaSeed = saltedMediaSeed(videoInfo.mediaName(), instanceIndex + SEED_SALT);
         buildSamplingLookups();
         buildScaleLookups();
+        damageMasks = null;   // a restart must not reuse masks built for a previous run
     }
 
     @Override
@@ -107,9 +106,11 @@ public class FrameMottler extends FrameProcessor {
         double[] stainField = buildMultiScaleNoiseField(info.frameNumber(), STAIN_FIELD_SALT);
         int damageMaskSegment = info.frameNumber() / DAMAGE_MASK_BLEND_FRAMES;
         double damageMaskBlend = (info.frameNumber() % DAMAGE_MASK_BLEND_FRAMES) / (double) DAMAGE_MASK_BLEND_FRAMES;
-        ensureDamageMaskFields(damageMaskSegment);
+        DamageMaskPair masks = ensureDamageMaskFields(damageMaskSegment);
 
-        mottleFrame(pixels, brightnessField, stainField, damageMaskBlend);
+        // Each call works only on its own frame's local arrays and the immutable masks snapshot, so any number
+        // of workers can run process() at once without locking.
+        mottleFrame(pixels, brightnessField, stainField, masks, damageMaskBlend);
     }
 
     private void buildSamplingLookups() {
@@ -171,14 +172,20 @@ public class FrameMottler extends FrameProcessor {
         }
     }
 
-    private void ensureDamageMaskFields(int segment) {
-        if (segment == cachedDamageMaskSegment) {
-            return;
-        }
-
-        cachedDamageMaskSegment = segment;
-        damageMaskA = buildNoiseField(segment, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES);
-        damageMaskB = buildNoiseField(segment + 1, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES);
+    // Returns the damage masks for this segment. The snapshot is built entirely into locals and published with one 
+    // volatile write, so a worker sees the old snapshot or the new one.
+    private DamageMaskPair ensureDamageMaskFields(int segment) {
+    	DamageMaskPair current = damageMasks;
+    	if (current != null && current.segment() == segment) {
+    		return current; // common case: no locking, no building
+    	}
+    	
+    	 DamageMaskPair built = new DamageMaskPair(
+    			 segment,
+    			 buildNoiseField(segment, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES),
+    			 buildNoiseField(segment + 1, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES));
+    	 damageMasks = built;
+    	 return built;
     }
 
     private double[] buildMultiScaleNoiseField(int frameNumber, int fieldSalt) {
@@ -269,10 +276,13 @@ public class FrameMottler extends FrameProcessor {
         }
     }
 
+    // Takes the masks snapshot as a parameter rather than reading a field, so a frame always uses one 
+    // consistent pair of masks even if another worker publishes a newer snapshot mid-frame.
     private void mottleFrame(
             ByteBuffer pixels,
             double[] brightnessField,
             double[] stainField,
+            DamageMaskPair masks,
             double damageMaskBlend) {
         int height = videoInfo.imageHeight();
         int width = videoInfo.imageWidth();
@@ -287,13 +297,9 @@ public class FrameMottler extends FrameProcessor {
                 int blockXEnd = Math.min(blockX + EFFECT_BLOCK_SIZE, width);
                 int sampleX = (blockX + blockXEnd - 1) / 2;
 
-                if (!prepareScaleIndicesForBlock(
-                        sampleX,
-                        sampleY,
-                        brightnessField,
-                        stainField,
-                        damageMaskBlend)) {
-                    continue;
+                BlockIndices scales = scalesForBlock(sampleX, sampleY, brightnessField, stainField, masks, damageMaskBlend);
+                if (scales == null) {
+                    continue;   // no damage here, so leave this block untouched
                 }
 
                 applyMottleBlock(
@@ -303,32 +309,36 @@ public class FrameMottler extends FrameProcessor {
                         blockY,
                         blockYEnd,
                         channels,
-                        stride);
+                        stride,
+                        scales);
             }
         }
     }
-
-    private boolean prepareScaleIndicesForBlock(
+    
+    // Decides how strongly one block is affected and returns its three channel scale indices, or null
+    // if the damage mask leaves the block untouched. The result is returned rather than stored in fields,
+    // because fields would be shared by every frame being processed at once.
+    private BlockIndices scalesForBlock(
             int x,
             int y,
             double[] brightnessField,
             double[] stainField,
+            DamageMaskPair masks,
             double damageMaskBlend) {
-        double damageStrength = sampleDamageMask(x, y, damageMaskBlend);
+        double damageStrength = sampleDamageMask(masks, x, y, damageMaskBlend);
         if (damageStrength <= 0.0) {
-            return false;
+            return null;
         }
 
         double brightness = smoothstep(sampleField(brightnessField, x, y));
         double stain = smoothstep(sampleField(stainField, x, y));
 
-        setBlockScaleIndices(brightness, stain, damageStrength);
-        return true;
+        return setBlockScales(brightness, stain, damageStrength);
     }
 
-    private double sampleDamageMask(int x, int y, double damageMaskBlend) {
-        double maskA = sampleField(damageMaskA, x, y);
-        double maskB = sampleField(damageMaskB, x, y);
+    private double sampleDamageMask(DamageMaskPair masks, int x, int y, double damageMaskBlend) {
+        double maskA = sampleField(masks.a(), x, y);
+        double maskB = sampleField(masks.b(), x, y);
         double mask = smoothstep(lerp(maskA, maskB, damageMaskBlend));
         return smoothstep((mask - DAMAGE_MASK_THRESHOLD) / (1.0 - DAMAGE_MASK_THRESHOLD));
     }
@@ -346,8 +356,10 @@ public class FrameMottler extends FrameProcessor {
         double bottom = lerp(field[y1 * NOISE_GRID_WIDTH + x0], field[y1 * NOISE_GRID_WIDTH + x1], xBlend);
         return lerp(top, bottom, yBlend);
     }
-
-    private void setBlockScaleIndices(double brightness, double stain, double damageStrength) {
+    
+    // Converts the brightness, stain and damage values for one block into lookup-table indices for the
+    // blue, green and red channels.
+    private BlockIndices setBlockScales(double brightness, double stain, double damageStrength) {
         double brightnessScale;
         if (brightness < 0.5) {
             brightnessScale = 1.0 - (0.5 - brightness) * 2.0 * MAX_DARKEN_PERCENTAGE / 100.0;
@@ -362,10 +374,8 @@ public class FrameMottler extends FrameProcessor {
         double blueScale = brightnessScale * (1.0 - stainStrength * BLUE_STAIN_LOSS_PERCENTAGE / 100.0);
         double greenScale = brightnessScale * (1.0 + stainStrength * GREEN_STAIN_BOOST_PERCENTAGE / 100.0);
         double redScale = brightnessScale * (1.0 + stainStrength * RED_STAIN_BOOST_PERCENTAGE / 100.0);
-
-        blockBlueScaleIndex = scaleIndex(blueScale);
-        blockGreenScaleIndex = scaleIndex(greenScale);
-        blockRedScaleIndex = scaleIndex(redScale);
+        
+        return new BlockIndices(scaleIndex(blueScale), scaleIndex(greenScale), scaleIndex(redScale));
     }
 
     private void applyMottleBlock(
@@ -375,10 +385,11 @@ public class FrameMottler extends FrameProcessor {
             int blockY,
             int blockYEnd,
             int channels,
-            int stride) {
-        byte[] blueLookup = scaleLookups[blockBlueScaleIndex];
-        byte[] greenLookup = scaleLookups[blockGreenScaleIndex];
-        byte[] redLookup = scaleLookups[blockRedScaleIndex];
+            int stride,
+            BlockIndices indices) {
+        byte[] blueLookup = scaleLookups[indices.blue()];
+        byte[] greenLookup = scaleLookups[indices.green()];
+        byte[] redLookup = scaleLookups[indices.red()];
 
         for (int y = blockY; y < blockYEnd; y++) {
             int rowStart = y * stride;
@@ -414,4 +425,11 @@ public class FrameMottler extends FrameProcessor {
     private double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(value, max));
     }
+    
+    // The two damage-mask noise fields for one segment. Immutable, so it can be shared between workers.
+    private record DamageMaskPair(int segment, double[] a, double[] b) { }
+    
+	// The blue, green and red lookup-table indices for one block. Returned from scalesForBlock instead of
+	// being kept in fields, so concurrent frames cannot overwrite each other's values.
+    private record BlockIndices(int blue, int green, int red) { }
 }
