@@ -4,7 +4,7 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Vanessa Soetjiadi, a1945309
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -26,6 +26,13 @@ import org.bytedeco.javacv.Frame;
  * the video timeline. {@link #process(Frame, InfoFrame)} finds the scratch
  * segment visible in the current frame and draws it as a black vertical line.
  * </p>
+ * 
+ * <p>
+ * Thread safety: {@link VideoPlayerModel} processes several frames at once, each on a different worker thread.
+ * The scratch timeline is built once per run in {@link #initialise(InfoVideo)} and only read afterwards. It is held as
+ * an immutable list that is replaced as a whole, never modified in place, because {@code initialise} runs again after 
+ * every restart while a worker may still be finishing a frame from the previous run.
+ * </p>
  */
 public class FrameScratcher extends FrameProcessor {
     private static final int FRAMES_PER_NEW_SCRATCH = 48;
@@ -36,8 +43,12 @@ public class FrameScratcher extends FrameProcessor {
     private static int nextInstanceIndex;
 
     private final int instanceIndex;
-    private final List<Scratch> scratches = new ArrayList<>();
     private int mediaSeed;
+    
+    // The scratch list for this run, it is replaced with one volatile write rather than cleared and refilled.
+    // initialise() runs again on every restart while a worker may still be finishing a frame from the
+    // previous run, and clearing a list another thread is iterating on would throw ConcurrentModificationException.
+    private volatile List<Scratch> scratches = List.of();
 
     public FrameScratcher() {
         super();
@@ -71,8 +82,12 @@ public class FrameScratcher extends FrameProcessor {
 
         double frameStart = info.frameNumber();
         double frameEnd = frameStart + 1.0;
+        
+        // Take one snapshot of the scratch list and use it for the whole frame, so a restart that publishes
+        // a new list part-way through cannot give this frame a mixture of two lists.
+        List<Scratch> current = scratches;
 
-        for (Scratch scratch : scratches) {
+        for (Scratch scratch : current) {
             double scratchStart = Math.max(scratch.startFrame(), frameStart);
             double scratchEnd = Math.min(scratch.endFrame(), frameEnd);
 
@@ -86,11 +101,13 @@ public class FrameScratcher extends FrameProcessor {
     }
 
     private void generateScratches() {
-        scratches.clear();
-
+    	// Nothing to scratch (no frames or no width): publish an empty list rather than leaving a stale one.
         if (videoInfo.totalVideoFrames() <= 0 || videoInfo.imageWidth() <= 0) {
-            return;
+        	scratches = List.of();
+        	return;
         }
+        
+        List<Scratch> built = new ArrayList<>();
 
         Random random = new Random(mediaSeed);
         double scratchStartProbability = 1.0 / FRAMES_PER_NEW_SCRATCH;
@@ -105,9 +122,14 @@ public class FrameScratcher extends FrameProcessor {
                 boolean thick = random.nextDouble() < THICK_SCRATCH_PROBABILITY;
 
                 xEnd = clamp(xEnd, 0, videoInfo.imageWidth() - 1);
-                scratches.add(new Scratch(startFrame, endFrame, xStart, xEnd, thick));
+                built.add(new Scratch(startFrame, endFrame, xStart, xEnd, thick));
             }
         }
+        
+        // Built completely into a local list first, then published with a single volatile write, so another
+        // thread sees either the old timeline or the new one, never a half-filled list. copyOf also makes it
+        // immutable, which makes it safe to share.
+        scratches = List.copyOf(built);
     }
 
     private double nextExponential(Random random, double mean) {

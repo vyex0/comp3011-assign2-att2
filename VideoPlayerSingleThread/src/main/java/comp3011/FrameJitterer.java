@@ -4,7 +4,7 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Vanessa Soetjiadi, a1945309
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -25,6 +25,13 @@ import org.bytedeco.javacv.Frame;
  * offsets. {@link #jitterFrame(ByteBuffer, int, int)} copies the original pixels
  * into the shifted position and fills exposed areas with black.
  * </p>
+ * 
+ * 
+ * <p>
+ * Thread safety: {@link VideoPlayerModel} processes several frames at once, each on a different worker thread.
+ * The copy of the unshifted frame that the shifted frame is rebuilt from is therefore per-thread scratch space
+ * (see {@link #sourceScratch(int)}) rather than a field shared by every worker.
+ * </p>
  */
 public class FrameJitterer extends FrameProcessor {
     private static final int SEED_SALT = 0x4a495454;
@@ -33,8 +40,14 @@ public class FrameJitterer extends FrameProcessor {
 
     private final int instanceIndex;
     private int mediaSeed;
-    private byte[] sourcePixels;
+
+    // A row of zeroes used to fill the edges that are empty due to the shift. Built once in initialise()
+    // and only ever read afterwards so it is safe to share between worker threads.
     private byte[] blackRow;
+    
+    // Per-thread copy of the unshifted frame. The shifted frame is rebuilt from this copy, so a
+    // buffer shared between workers would let one frame be drawn from another frame's pixels.
+    private final ThreadLocal<byte[]> sourceScratch = new ThreadLocal<>();
 
     public FrameJitterer() {
         super();
@@ -46,10 +59,8 @@ public class FrameJitterer extends FrameProcessor {
         super.initialise(videoInfo);
         mediaSeed = saltedMediaSeed(videoInfo.mediaName(), instanceIndex + SEED_SALT);
 
-        int frameBytes = videoInfo.imageStride() * videoInfo.imageHeight();
-        int widthBytes = videoInfo.imageWidth() * videoInfo.imageChannels();
-        sourcePixels = new byte[frameBytes];
-        blackRow = new byte[widthBytes];
+        // Read-only after this point, so every worker can share it.
+        blackRow = new byte[videoInfo.imageWidth() * videoInfo.imageChannels()];
     }
 
     @Override
@@ -79,6 +90,19 @@ public class FrameJitterer extends FrameProcessor {
         }
 
         jitterFrame(pixels, xOffset, yOffset);
+    }
+
+    /**
+     * Return this thread's scratch copy buffer, creating it on first use on this thread or when the video's
+     * frame size changes. The buffer is fully overwritten for every frame, so it never carries data over.
+     */
+    private byte[] sourceScratch(int frameBytes) {
+    	byte[] buffer = sourceScratch.get();
+    	if (buffer == null || buffer.length != frameBytes) {
+    		buffer = new byte[frameBytes];
+    		sourceScratch.set(buffer);
+    	}
+    	return buffer;
     }
 
     private long seedForFrame(int frameNumber) {
@@ -129,18 +153,23 @@ public class FrameJitterer extends FrameProcessor {
         int stride = videoInfo.imageStride();
         int frameBytes = stride * height;
         int widthBytes = width * channels;
+        
+        byte[] sourcePixels = sourceScratch(frameBytes);
 
-        ByteBuffer source = pixels.duplicate();
-        source.clear();
-        source.get(sourcePixels, 0, frameBytes);
-
+        /**
+         * Absolute get/put calls are used rather than duplicate() because they take an explicit index, so they allocate
+         * nothing and leave the buffer's position and limit untouched for the code that uses the frame next.
+         * This is because duplicate() allocates a new small object every time it's called, and we're calling it once per row
+         * which is roughly 800 rows per frame. get/put is used to improve the performance.
+         */
+        // Snapshots the unshifted frame, then blank the real frame and copy the snapshot
+        // back in at the jittered offset.
+        pixels.get(0, sourcePixels, 0, frameBytes);
+        
         for (int y = 0; y < height; y++) {
-            ByteBuffer destinationRow = pixels.duplicate();
-            destinationRow.clear();
-            destinationRow.position(y * stride);
-            destinationRow.put(blackRow, 0, widthBytes);
+        	pixels.put(y * stride, blackRow, 0, widthBytes);
         }
-
+        
         int sourceYStart = Math.max(0, -yOffset);
         int destinationYStart = Math.max(0, yOffset);
         int rowsToCopy = height - Math.abs(yOffset);
@@ -156,11 +185,7 @@ public class FrameJitterer extends FrameProcessor {
         for (int row = 0; row < rowsToCopy; row++) {
             int sourceIndex = (sourceYStart + row) * stride + sourceXByteStart;
             int destinationIndex = (destinationYStart + row) * stride + destinationXByteStart;
-
-            ByteBuffer destination = pixels.duplicate();
-            destination.clear();
-            destination.position(destinationIndex);
-            destination.put(sourcePixels, sourceIndex, rowBytesToCopy);
+            pixels.put(destinationIndex, sourcePixels, sourceIndex, rowBytesToCopy);
         }
     }
 }

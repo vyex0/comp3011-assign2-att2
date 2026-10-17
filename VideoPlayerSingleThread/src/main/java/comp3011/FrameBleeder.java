@@ -25,9 +25,10 @@ import org.bytedeco.javacv.Frame;
  * </p>
  * 
  * <p>
- * Thread safety: several frames are processed at once, so the three mask arrays are per-thread scratch
- * space (see {@link #scratchBuffers()}) rather than fields shared by every worker. The sampling lookups
- * {@link #initialise(InfoVideo)} are only read afterwards.
+ * Thread safety: {@link VideoPlayerModel} processes several frames at once, each on a different worker thread.
+ * Now, the three mask arrays: brightMask, horizontalBlurMask and blurredMask that were once instance arrays, use
+ * a per-thread scratch space (see {@link #scratchBuffers()}) rather than fields shared by every threads worker.
+ * The sampling lookups {@link #initialise(InfoVideo)} are only read afterwards.
  * </p>
  */
 public class FrameBleeder extends FrameProcessor {
@@ -47,6 +48,7 @@ public class FrameBleeder extends FrameProcessor {
     private int[] yMaskTop;
     private double[] yMaskBlend;
     
+    // One set of scratch mask per worker thread. ThreadLocal means no locking and no per-frame allocation.
     private final ThreadLocal<MaskBuffers> scratch = new ThreadLocal<>();
 
     public FrameBleeder() {
@@ -87,6 +89,11 @@ public class FrameBleeder extends FrameProcessor {
         applyBleed(pixels, buffers.blurred());
     }
     
+    /**
+     * Return this thread's scratch masks, creating them on first use on this thread or when the mask size changes.
+     * Each stage rewrites every cell of its output on every frame, so a reused buffer never holds data from the
+     * previous frame.
+     */
     private MaskBuffers scratchBuffers() {
     	int size = maskWidth * maskHeight;
     	MaskBuffers buffers = scratch.get();
@@ -266,7 +273,6 @@ public class FrameBleeder extends FrameProcessor {
     }
     
     // Scratch space for one frame's bleed calculation. Each worker thread gets its own copy so frames
-    // processed at the same time doesn't overwrite each other's mask. Every cell is rewritten on each
-    // frame, so a buffer never carries data over from the previous frame.
+    // processed at the same time don't overwrite each other's masks.
     private record MaskBuffers(double[] bright, double[] horizontal, double[] blurred) { }
 }
