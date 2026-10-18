@@ -5,6 +5,9 @@
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
  *   2. a1945309, Vanessa Soetjiadi
+ *   
+ * Modifications (Vanessa Soetjiadi):
+ * - Passes the effect list from CommandLineController.getFrameProcessors() to the VideoPlayerController.
  *
  * Copyright 2026 Simon Ratcliffe
  */
