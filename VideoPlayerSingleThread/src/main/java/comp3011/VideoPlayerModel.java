@@ -5,6 +5,9 @@
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
  *   2. Vanessa Soetjiadi, a1945309
+ *   
+ * Modifications:
+ * - The playback clock (anchor, pre-roll, pause shift and its lock) moved out of this class into PlaybackClock.
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -12,6 +15,7 @@ package comp3011;
 
 import java.io.File;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.Queue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -51,7 +55,7 @@ public class VideoPlayerModel {
     private static final long FIVE_SECONDS_US = 5_000_000L;
     private static final long AUDIO_LEAD_NS = 30_000_000L;
     
-    // Identifies the computer's available core, and creates roughly (cores - 1) threads from it.
+    // Identifies the computer's available core, and creates roughly (cores - 2) threads from it.
 	private static final int EFFECTS_WORKER_COUNT = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
 	
 	/**
@@ -87,14 +91,11 @@ public class VideoPlayerModel {
 	// the wokers are kept busy.
 	private static final int MAX_FRAMES_IN_FLIGHT = EFFECTS_WORKER_COUNT + 2;
 	
-	private static final long PRE_ROLL_NS = 150_000_000L; // delay after a restart so the first frames can be processed
-	
 	/**
-	 * Guards the playback clocks: firstTimestampUs, logicalPlaybackBaseUs, playbackStartNs and pauseStartedNs.
-	 * These fields are written by the decoder thread, and the JavaFX thread. Every read or write must happen
-	 * inside synchronized (clockLock) so no thread ever sees a  half-updated clock.
+	 * All playback timing (anchor, pre-roll, pause shift). The decoder thread and the JavaFX thread both use it,
+	 * so every access goes through this object, which guards its own state with a lock. See PlaybackClock.
 	 */
-	private final Object clockLock = new Object();
+	private final PlaybackClock clock = new PlaybackClock();
 	
     private final List<FrameProcessor> frameProcessors;
     // Modified to use ConcurrentLinkedQueue because ArrayDeque is not thread safe for concurrent
@@ -123,10 +124,9 @@ public class VideoPlayerModel {
 
     private File videoFile; // Path to the media that comes from the command line
     private FFmpegFrameGrabber grabber; // This is the 3rd party video media decoder. It deals in JavaCV Frame objects.
-    private JavaFXFrameConverter converter; // Takes Frame objects to JavaFX Image objects, which can be put on screen.
     private AudioPlayer audioPlayer; // This is ours. It has some real time buffering smarts.
     private PreparedFrame preparedFrame; // Ours, but is just an Image with some meta-data added.
-    // private boolean prepareNextFrameQueued; // True only when the event loop needs to call our prepareNextFrame method.
+
     // Made to be volatile to guarantee that decoder sees change immediately instead of using stale cached value. 
     private volatile boolean playbackOpen; // True when playback is happening.
     private volatile boolean pauseRequested;
@@ -139,10 +139,6 @@ public class VideoPlayerModel {
     private double frameRate;
     private int intFrameRate;
     private int totalVideoFrames;
-    private long firstTimestampUs = NO_SEEK_REQUEST;
-    private long logicalPlaybackBaseUs;
-    private long playbackStartNs;
-    private long pauseStartedNs;
     private long relativeSeekBaseUs = NO_SEEK_REQUEST;
     
     private volatile boolean endOfStreamReached; // grabber returned null, but queued frames may still need showing
@@ -181,7 +177,6 @@ public class VideoPlayerModel {
         this.statusChangedHandler = statusChangedHandler;
         this.playbackStateChangedHandler = playbackStateChangedHandler;
         this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
-        
         this.frameProcessors = frameProcessors;
     }
 
@@ -220,10 +215,10 @@ public class VideoPlayerModel {
         relativeSeekBaseUs = NO_SEEK_REQUEST;
 
         if (pauseRequested) {
-        	synchronized (clockLock) { pauseStartedNs = System.nanoTime(); }
+        	clock.pause(System.nanoTime());
             flushAudioOutput();
         } else {
-            resumePlaybackClock(System.nanoTime());
+        	clock.resume(System.nanoTime());
         }
 
         notifyPlaybackStateChanged();
@@ -312,7 +307,6 @@ public class VideoPlayerModel {
     }
 
     private void openPlaybackResources(long startTimestampUs) throws Exception {
-        // converter = new JavaFXFrameConverter();
         grabber = new FFmpegFrameGrabber(videoFile);
         grabber.setImageMode(FrameGrabber.ImageMode.COLOR);
         grabber.setSampleMode(FrameGrabber.SampleMode.SHORT);
@@ -351,23 +345,7 @@ public class VideoPlayerModel {
         preparedFrame = null;
         currentTimestampUs = logicalTimestampUs;
         relativeSeekBaseUs = logicalTimestampUs;
-        synchronized (clockLock) {
-            firstTimestampUs = NO_SEEK_REQUEST;
-            logicalPlaybackBaseUs = logicalTimestampUs;
-            playbackStartNs = 0;
-            pauseStartedNs = pauseRequested ? System.nanoTime() : 0;
-        }
-    }
-
-    // Shifts the playback clock forward by the length of a pause so that playback resumes where it left
-    // off instead of jumping ahead. Called on the JavaFX thread when the user resumes.
-    private void resumePlaybackClock(long now) {
-    	synchronized (clockLock) {
-            if (pauseStartedNs > 0 && playbackStartNs > 0) {
-                playbackStartNs += now - pauseStartedNs;
-            }
-            pauseStartedNs = 0;
-        }
+        clock.reset(logicalTimestampUs, pauseRequested, System.nanoTime());
     }
     
     /**
@@ -476,21 +454,10 @@ public class VideoPlayerModel {
                 frameProcessorsInitialised = true;
             }
 
-
-            final long logicalTimestampUs;
-            final long targetTimeNs;
-            synchronized (clockLock) {
-            	if (firstTimestampUs == NO_SEEK_REQUEST) {
-                    firstTimestampUs = timestampUs;
-                    playbackStartNs = System.nanoTime() + PRE_ROLL_NS;
-                    if (pauseRequested) {
-                    	pauseStartedNs = System.nanoTime();
-                    }
-                }
-                long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
-                logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
-                targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
-            }
+            // The clock anchors itself on the first frame after a start/seek and times every later frame from it.
+            PlaybackClock.FrameTiming timing = clock.schedule(timestampUs, pauseRequested, System.nanoTime());
+            final long logicalTimestampUs = timing.logicalTimestampUs();
+            final long targetTimeNs = timing.targetTimeNs();
             
             int frameNumber = grabber.getFrameNumber();
             InfoFrame info = new InfoFrame(frameNumber, timestampUs);
@@ -535,7 +502,7 @@ public class VideoPlayerModel {
                     }
                 }
             }
-            if (preparedFrame != null && dueTimeNs(preparedFrame.mediaTimestampUs()) <= now) {
+            if (preparedFrame != null && clock.dueTimeNs(preparedFrame.mediaTimestampUs()) <= now) {
                 displayPreparedFrame(now);
             }
         }
@@ -599,24 +566,25 @@ public class VideoPlayerModel {
      * to the audio player, or discards it when audio output is disabled.
      */
     private void writeDueAudio(long now) {
-    	// Snapshot the clock under the lock so both values come from the same consistent state.
-    	long first, start;
-    	synchronized (clockLock) { first = firstTimestampUs; start = playbackStartNs; }
-    	
     	// No audio device: nothing can ever be played, so drop whatever is queued.
         if (audioPlayer == null) {
             pendingAudio.clear(); return;
         }
         
-        // Nothing is due while paused or before the first frame has set the clock anchor.
-        if (pauseRequested || first == NO_SEEK_REQUEST || start <= 0) {
-    	    return;
-    	}
+        // Nothing is due while paused
+        if (pauseRequested) {
+        	return;
+        }
         
-        // Timestamp to which audio should have been played by now, including small lead
-        // so audio device never runs dry.
-        long dueTimestampUs = first + (now + AUDIO_LEAD_NS - start) / 1_000L;
+        // Timestamp to which audio should have been played by now, including small lead so audio never
+        // runs dry. The clock answers from one consistent snapshot, and is empty until the first frame 
+        // has set its anchor.
+        OptionalLong due = clock.mediaTimestampAtUs(now + AUDIO_LEAD_NS);
+        if (due.isEmpty()) {
+        	return;
+        }
         
+        long dueTimestampUs = due.getAsLong();
         
         while (!pendingAudio.isEmpty()) {
             PendingAudio audio = pendingAudio.peek();
@@ -671,7 +639,7 @@ public class VideoPlayerModel {
         stopDecoder();		  // 2. wait until it's idle. MUST happen before the grabber is closed
         pendingGrabSeekUs = NO_SEEK_REQUEST;
         pendingAudio.clear();
-        clearPlaybackClock();
+        clock.clear();
         audioAvailable = false;
         frameProcessorsInitialised = false;
         
@@ -722,31 +690,6 @@ public class VideoPlayerModel {
         }
 
         return Math.max(0, durationUs - frameDurationUs);
-    }
-    
-    /**
-     * Returns a wall-clock time at which the frame with the given media timsestamp is due
-     * on scree: the anchor's start time plus the frame's offset from the anchor. Reads the clock
-     * under clockLock so the two fields are always from the same consistent state.
-     */
-    private long dueTimeNs(long mediaTimestampUs) {
-        synchronized (clockLock) {
-            long relativeUs = Math.max(0, mediaTimestampUs - firstTimestampUs);
-            return playbackStartNs + relativeUs * 1_000L;
-        }
-    }
-    
-    /**
-     * Clears the playback clock when playback is closed, so a later restart doesn't inherit
-     * stale timing. Fields are cleared together under clockLock so the decoder never sees a
-     * partial reset.
-     */
-    private void clearPlaybackClock() {
-        synchronized (clockLock) {
-            firstTimestampUs = NO_SEEK_REQUEST;
-            playbackStartNs = 0;
-            pauseStartedNs = 0;
-        }
     }
 
     private void processFrame(Frame frame, InfoFrame info) throws Exception {
