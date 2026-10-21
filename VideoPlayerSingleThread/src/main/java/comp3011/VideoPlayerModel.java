@@ -8,15 +8,22 @@
  *   
  * Modifications:
  * - The playback clock (anchor, pre-roll, pause shift and its lock) moved out of this class into PlaybackClock.
+ * - The decoder thread, effects worker pool, in-flight frame queue and stop/flush logic moved out of this class
+ *   into FramePipeline; the grabber-specific decoder work is the inner class GrabberSource.
  *
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011;
 
 import java.io.File;
+import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalLong;
+import java.util.Random;
 import java.util.Queue;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
@@ -28,6 +35,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 import org.bytedeco.javacv.FFmpegFrameGrabber;
@@ -43,11 +51,11 @@ import javafx.scene.image.Image;
  * The model part of the video player model-view-controller architecture.
  *
  * <p>
- * Owns the FFmpeg decoder, playback clock, seeking logic, audio scheduling,
- * and frame processing - which it all manages through cooperative multi-tasking
- * on a single thread. It publishes decoded frames and playback state through
- * callbacks supplied by its owning {@link VideoPlayerController}, keeping it
- * decoupled from the JavaFX view.
+ * Owns the FFmpeg grabber, seeking logic and audio scheduling, and coordinates the rest: {@link PlaybackClock}
+ * decides when each frame is due, and {@link FramePipeline} decodes frames on one thread and applies the effects
+ * on several worker threads at once. Everything in this class runs on the JavaFX thread except {@link GrabberSource},
+ * which runs on the decoder thread. It publishes decoded frames and playback state through callbacks supplied by its
+ * {@link VideoPlayerController}, keeping it decoupled from the JavaFX view.
  * </p>
  */
 public class VideoPlayerModel {
@@ -55,47 +63,25 @@ public class VideoPlayerModel {
     private static final long FIVE_SECONDS_US = 5_000_000L;
     private static final long AUDIO_LEAD_NS = 30_000_000L;
     
-    // Identifies the computer's available core, and creates roughly (cores - 2) threads from it.
-	private static final int EFFECTS_WORKER_COUNT = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
-	
-	/**
-	 * Creates a thread factory that names each thread and marks it as a daemon thread (daemon threads
-	 * don't keep the JVM alive, so the app can exit when the JavaFX window closes even when the pool
-	 * hasn't been shut down).
-	 */
-	private static ThreadFactory daemonThreads(String name) {
-		// Used to keep track of the number of different effect worker threads.
-		AtomicInteger count = new AtomicInteger();
-		return runnable -> {
-			Thread thread = new Thread(runnable, name + "-" + count.incrementAndGet());
-			thread.setDaemon(true);
-			return thread;
-		};
-	}
-	
-	// Creates the effect workers thread pool that is responsible for applying effects to the frames.
-	private static final ExecutorService EFFECTS_WORKERS = 
-			Executors.newFixedThreadPool(EFFECTS_WORKER_COUNT, daemonThreads("effects-worker"));
-	
-	// Decoded thread that owns the FFmpeg grabber and is the only one that calls grab() during playback.
-	// The graber isn't thread safe, so decoding is confined to this thread.
-	private static final ExecutorService DECODER = 
-			Executors.newSingleThreadExecutor(daemonThreads("decoder"));
-	
 	// Provides one converter per worker thread. Each worker reuses its own, so nothing is shared
 	// between threads and nothing is allocated per frame.
 	private static final ThreadLocal<JavaFXFrameConverter> WORKER_CONVERTER =
 			ThreadLocal.withInitial(JavaFXFrameConverter::new);
-	
-	// How many frames can be decoded but not yet displayed. It is made WORKER_COUNT + 2 so that
-	// the wokers are kept busy.
-	private static final int MAX_FRAMES_IN_FLIGHT = EFFECTS_WORKER_COUNT + 2;
 	
 	/**
 	 * All playback timing (anchor, pre-roll, pause shift). The decoder thread and the JavaFX thread both use it,
 	 * so every access goes through this object, which guards its own state with a lock. See PlaybackClock.
 	 */
 	private final PlaybackClock clock = new PlaybackClock();
+	
+	/**
+	 * The multi-threaded frame production line: the decoder thread, the effects workers and the ordered queue of
+	 * frames in flight. See FramePipeline for how the threads are divided up and why that is safe.
+	 */
+	private final FramePipeline<PreparedFrame> pipeline = new FramePipeline<>(this::onDecodeFailure);
+	
+	private volatile List<FrameProcessor> effectChain = List.of();
+	
 	
     private final List<FrameProcessor> frameProcessors;
     // Modified to use ConcurrentLinkedQueue because ArrayDeque is not thread safe for concurrent
@@ -141,27 +127,7 @@ public class VideoPlayerModel {
     private int totalVideoFrames;
     private long relativeSeekBaseUs = NO_SEEK_REQUEST;
     
-    private volatile boolean endOfStreamReached; // grabber returned null, but queued frames may still need showing
     private boolean displayWhilePaused; // Lets exactly one frame appear after a seek while paused
-
-    /**
-     * Bumped every time the decoder must be stopped (e.g., pause, seek, restart) and old work. Each decode 
-     * loops and effects task remembers the value it started under and abandon its work if the current
-     * generation value has changed. A counter is used instead of a boolean because a stale task may wake up
-     * long after the reset: a flag would already be back to valid' by then, whereas an old
-     * old number can never match again.
-     */
-    private final AtomicInteger generation = new AtomicInteger();
-    private final AtomicBoolean decodeScheduled = new AtomicBoolean(); // Marks whether a decoding job is running or not.
-    
-    // List of PreparedFrames fetched by the readNextVideoFrame(). ConcurrentLinkedQueue is used so several
-    // threads can run at the same time.
-    private final ConcurrentLinkedQueue<Future<PreparedFrame>> preparedFramesQueue = new ConcurrentLinkedQueue<Future<PreparedFrame>>();
-    
-    // JavaFX writes the target position (microseconds) here after stopping the decoder, the decoder thread
-    // reads it at the start of its next job and performs the slow grabber. Volatile so the decoder
-    // always sees the latest write.
-    private volatile long pendingGrabSeekUs = NO_SEEK_REQUEST;
 
     public VideoPlayerModel(
             boolean audioEnabled,
@@ -237,6 +203,7 @@ public class VideoPlayerModel {
 
     public void stopPlayback() {
         closePlaybackResources();
+        // preparedFrame = null;
         displayWhilePaused = true;
         currentTimestampUs = 0;
         pauseRequested = false;
@@ -246,9 +213,8 @@ public class VideoPlayerModel {
     }
 
     public void shutdown() {
-        closePlaybackResources();	// this uses DECODER, so shut it down after
-        DECODER.shutdownNow();
-        EFFECTS_WORKERS.shutdownNow();
+        closePlaybackResources(); // this uses DECODER, so shut it down after
+        pipeline.close(); // releases this player's threads only
     }
 
     private void seekRelative(long offsetUs) {
@@ -271,14 +237,14 @@ public class VideoPlayerModel {
             return;
         }
 
-        stopDecoder();                             // the decoder is now idle and its old frames are discarded
+        pipeline.flush(); // the decoder is now idle and its old frames are discarded
         resetPlaybackClock(logicalTimestampUs);
         if (pauseRequested) {
             displayWhilePaused = true;
         }
         flushAudioOutput();
-        pendingGrabSeekUs = grabTimestampUs;       // hand the actual seek to the decoder thread
-        requestDecoding();
+        pipeline.seek(grabTimestampUs); // hand the actual seek to the decoder thread
+        pipeline.requestDecoding();
         notifyPlaybackStateChanged();
     }
 
@@ -299,7 +265,7 @@ public class VideoPlayerModel {
             resetPlaybackClock(currentTimestampUs);
             playbackOpen = true;
             playbackTimer.start();
-            requestDecoding();
+            pipeline.requestDecoding();
             notifyPlaybackStateChanged();
         } catch (Exception e) {
             handlePlaybackError(e);
@@ -331,9 +297,10 @@ public class VideoPlayerModel {
         if (audioAvailable) {
             audioPlayer.open(grabber.getSampleRate(), grabber.getAudioChannels());
         }
-
+        
+        pipeline.begin(new GrabberSource());
         if (startTimestampUs > 0) {
-        	pendingGrabSeekUs = startTimestampUs;   // the decoder thread performs it on its first job
+        	pipeline.seek(startTimestampUs);   // the decoder thread performs it on its first job
         }
     }
 
@@ -348,135 +315,15 @@ public class VideoPlayerModel {
         clock.reset(logicalTimestampUs, pauseRequested, System.nanoTime());
     }
     
-    /**
-     * Asks the decoder to decode more frames in the preparedFramesQueue. It is called repeatedly
-     * on every heartbeat and returns if the queue is full. The decodeScheduled ensures at most
-     * one decode job exists at a time.
-     */
-    private void requestDecoding() {
-    	if (!playbackOpen || endOfStreamReached
-    			|| preparedFramesQueue.size() >= MAX_FRAMES_IN_FLIGHT
-    			|| !decodeScheduled.compareAndSet(false, true)) {
-    		return;
-    	}
-    	int gen = generation.get();
-    	DECODER.execute(() -> decodeLoop(gen));
-    }
-    
-    /**
-     * Runs on the decoder thread. Reads frames and hands each one to an effects worker until the
-     * queue is full, the stream ends, or this job becomes stale.
-     */
-    private void decodeLoop(int gen) {
-    	try {
-    		long seekUs = pendingGrabSeekUs;
-    		if (seekUs != NO_SEEK_REQUEST && gen == generation.get()) {
-    	        pendingGrabSeekUs = NO_SEEK_REQUEST;
-    	        grabber.setTimestamp(seekUs);
-    	    }
-    		while (gen == generation.get() && playbackOpen && !endOfStreamReached
-                    && preparedFramesQueue.size() < MAX_FRAMES_IN_FLIGHT) {
-    			// Grabs one frame, submits it to the worker, and queues the future, so the decoder
-    			// can move on while the worker is still processing.
-    			Future<PreparedFrame> next = readNextVideoFrame(gen);
-    			if (next == null) {
-    				break;
-    			}
-    			preparedFramesQueue.offer(next);
+    // Called by the pipeline, on the decoder thread, when reading or decoding fails.
+    private void onDecodeFailure(Exception e, BooleanSupplier stillCurrent) {
+    	// Handle it on the JavaFX thread. By the time that runs the user may have sought away from the run that
+    	// failed, in which case the error is about frames nobody will see and is ignored.
+    	Platform.runLater(() -> {
+    		if (stillCurrent.getAsBoolean()) {
+    			handlePlaybackError(e);
     		}
-    	} catch (Exception e) {
-    		Platform.runLater(() -> {
-                if (gen == generation.get()) {
-                    handlePlaybackError(e);
-                }
-            });
-    	} finally {
-    		decodeScheduled.set(false);
-    	}
-    }
-    
-    /**
-     * Stops the decoder, waits until it's idle, and discards every queued frame. Only called from the JavaFX thread.
-     */
-    private void stopDecoder() {
-    	generation.incrementAndGet(); // 1. decoder loop and queued effects tasks now see they're stale
-    	try {
-    		DECODER.submit(() -> { }).get(); // 2. runs after any in-progress decode, so it is a barrier
-    	} catch (InterruptedException e) {
-    		Thread.currentThread().interrupt();
-    	} catch (ExecutionException | RejectedExecutionException e) {
-    		// Executor already shut down; nothing left to wait for.
-    	}
-    	clearPreparedFrames(); // 3. now nothing can add to the queue behind our back
-    }
-    
-    private void clearPreparedFrames() {
-    	for (Future<PreparedFrame> frames : preparedFramesQueue) {
-    		frames.cancel(true);
-    	}
-    	
-    	preparedFramesQueue.clear();
-    	preparedFrame = null;
-    	endOfStreamReached = false;
-    }
-
-    // Modified to grab one picture frame and hand the effect work to a worker.
-    private Future<PreparedFrame> readNextVideoFrame(int gen) throws Exception {
-        while (playbackOpen && gen == generation.get()) {
-            Frame frame = grabFrame();
-            if (frame == null) {
-            	endOfStreamReached = true; // don't finish yet, some frames might still in flight
-            	return null;
-            }
-
-            long timestampUs = grabber.getTimestamp();
-            if (audioAvailable && frame.samples != null) {
-                queueAudio(timestampUs, frame);
-            }
-
-            if (frame.image == null) {
-                continue;
-            }
-
-            if (!frameProcessorsInitialised) {
-                initialiseFrameProcessors(new InfoVideo(
-                        mediaName(videoFile),
-                        totalVideoFrames,
-                        frame.imageWidth,
-                        frame.imageHeight,
-                        frame.imageDepth,
-                        frame.imageChannels,
-                        frame.imageStride,
-                        frameRate,
-                        intFrameRate,
-                        videoFrameDurationUs,
-                        grabber.getPixelFormat()));
-                frameProcessorsInitialised = true;
-            }
-
-            // The clock anchors itself on the first frame after a start/seek and times every later frame from it.
-            PlaybackClock.FrameTiming timing = clock.schedule(timestampUs, pauseRequested, System.nanoTime());
-            final long logicalTimestampUs = timing.logicalTimestampUs();
-            final long targetTimeNs = timing.targetTimeNs();
-            
-            int frameNumber = grabber.getFrameNumber();
-            InfoFrame info = new InfoFrame(frameNumber, timestampUs);
-            Frame copy = frame.clone();
-            
-            return EFFECTS_WORKERS.submit(() -> {
-            	if (gen != generation.get()) {
-            		throw new CancellationException("stale frame from before a seek/stop");
-            	}
-            	processFrame(copy, info);
-            	// Each worker thread is modified to use their own converter instead 
-            	// of creating a new one for every frame.
-            	Image image = WORKER_CONVERTER.get().convert(copy);
-        		return new PreparedFrame(image, frameNumber, timestampUs, 
-        				logicalTimestampUs, targetTimeNs, System.nanoTime());
-            });
-        }
-        
-        return null;
+    	});
     }
 
     private void pumpPlayback(long now) {
@@ -491,30 +338,25 @@ public class VideoPlayerModel {
         // so a pause/resume shifts every queued frame.
         if (!pauseRequested || displayWhilePaused) {
             if (preparedFrame == null) {
-                Future<PreparedFrame> head = preparedFramesQueue.peek();
-                if (head != null && head.isDone()) {
-                    preparedFramesQueue.poll();
-                    try {
-                        preparedFrame = head.get();
-                    } catch (Exception e) {
-                        handlePlaybackError(e);
-                        return;
-                    }
-                }
+            	try {
+            		preparedFrame = pipeline.pollReady();
+            	} catch (Exception e) {
+            		handlePlaybackError(e);
+            		return;
+            	}
             }
             if (preparedFrame != null && clock.dueTimeNs(preparedFrame.mediaTimestampUs()) <= now) {
                 displayPreparedFrame(now);
             }
         }
         
-        // Everything grabbed and shown: now it's safe to finish.
-        if (endOfStreamReached && preparedFrame == null && preparedFramesQueue.isEmpty()) {
+        if (pipeline.isDrained() && preparedFrame == null) {
             finishPlayback(); return;
         }
 
         // Task (3): top up the frame queue. Does nothing if the queue is full or a decode job is already running.
         if (!pauseRequested) {
-        	requestDecoding();
+        	pipeline.requestDecoding();
         }
     }
 
@@ -636,8 +478,7 @@ public class VideoPlayerModel {
     private void closePlaybackResources() {
         playbackTimer.stop();
         playbackOpen = false; // 1. tell the decoder loop to stop
-        stopDecoder();		  // 2. wait until it's idle. MUST happen before the grabber is closed
-        pendingGrabSeekUs = NO_SEEK_REQUEST;
+        pipeline.end(); // 2. wait until the decoder is idle. MUST happen before the grabber is closed
         pendingAudio.clear();
         clock.clear();
         audioAvailable = false;
@@ -693,7 +534,7 @@ public class VideoPlayerModel {
     }
 
     private void processFrame(Frame frame, InfoFrame info) throws Exception {
-        for (FrameProcessor processor : frameProcessors) {
+        for (FrameProcessor processor : effectChain) {
             processor.process(frame, info);
         }
     }
@@ -702,6 +543,9 @@ public class VideoPlayerModel {
         for (FrameProcessor processor : frameProcessors) {
             processor.initialise(videoInfo);
         }
+        
+        // Fusing reads the tables the effects have just built, so it must come after they are initialised.
+        effectChain = FUSE_EFFECTS ? FusedPass.fuse(frameProcessors, videoInfo) : List.copyOf(frameProcessors);
     }
 
     private Frame grabFrame() throws Exception {
@@ -735,6 +579,381 @@ public class VideoPlayerModel {
 
     private void notifyAudioOutputStateChanged() {
         audioOutputStateChangedHandler.accept(audioOutputEnabled);
+    }
+    
+    /**
+     * Everything the decoder thread does with the FFmpeg grabber. The pipeline calls it only on the decoder thread,
+     * which is what keeps the (not thread-safe) grabber confined to one thread. It does the work that has to be done
+     * in order on that thread (grab, queue the audio, time the frame, copy it so the grabber can reuse its buffer),
+     * and hands back the part that can run in parallel on a worker: apply the effects and convert for display.
+     */
+    private final class GrabberSource implements FramePipeline.FrameSource<PreparedFrame> {
+    	@Override
+    	public void seek(long timestampUs) throws Exception {
+    		grabber.setTimestamp(timestampUs);
+    	}
+    	
+    	// Modified to grab one picture frame and hand the effect work to a worker.
+    	@Override
+    	public Callable<PreparedFrame> readNext(BooleanSupplier cancelled) throws Exception {
+    		while (playbackOpen && !cancelled.getAsBoolean()) {
+    			Frame frame = grabFrame();
+    			if (frame == null) {
+    				return null; // end of the stream; the pipeline keeps showing the frames still in flight
+    			}
+    			
+    			long timestampUs = grabber.getTimestamp();
+    			if (audioAvailable && frame.samples != null) {
+    				queueAudio(timestampUs, frame);
+    			}
+    			
+    			if (frame.image == null) {
+    				continue;
+    			}
+    			
+    			if (!frameProcessorsInitialised) {
+                    initialiseFrameProcessors(new InfoVideo(
+                            mediaName(videoFile),
+                            totalVideoFrames,
+                            frame.imageWidth,
+                            frame.imageHeight,
+                            frame.imageDepth,
+                            frame.imageChannels,
+                            frame.imageStride,
+                            frameRate,
+                            intFrameRate,
+                            videoFrameDurationUs,
+                            grabber.getPixelFormat()));
+                    frameProcessorsInitialised = true;
+                }
+    			
+    			// The clock anchors itself on the first frame after a start/seek and times every later frame from it.
+    			PlaybackClock.FrameTiming timing = clock.schedule(timestampUs, pauseRequested, System.nanoTime());
+                final long logicalTimestampUs = timing.logicalTimestampUs();
+                final long targetTimeNs = timing.targetTimeNs();
+                
+                int frameNumber = grabber.getFrameNumber();
+                InfoFrame info = new InfoFrame(frameNumber, timestampUs);
+                Frame copy = frame.clone();
+                
+                // This runs on an effects worker, later. (The pipeline refuses to start it if the run is stale.)
+                return () -> {
+                	processFrame(copy, info);
+                	// Each worker thread is modified to use their own converter instead
+                    // of creating a new one for every frame.
+                	Image image = WORKER_CONVERTER.get().convert(copy);
+                	return new PreparedFrame(image, frameNumber, timestampUs,logicalTimestampUs, targetTimeNs, System.nanoTime());
+                };
+    		}
+    		
+    		return null; // stopped while reading
+    	}
+    }
+    
+    // === Fusing effects passes === //
+    private static final boolean FUSE_EFFECTS = !Boolean.getBoolean("videoplayer.noFusion");
+    
+    static final class FusedPass extends FrameProcessor {
+        private interface Step { }
+        private record LutStep(byte[] blue, byte[] green, byte[] red) implements Step { }
+        private record FlickerStep(int mediaSeed) implements Step { }
+        private record GrayStep() implements Step { }
+        private record VignetteStep(byte[][] xLookups, byte[][] yLookups) implements Step { }
+
+        private static final int LUT = 0, VIGNETTE = 1, GRAY = 2;
+
+        private record Program(int count, int shape, int[] kind, byte[][] blue, byte[][] green, byte[][] red,
+                byte[][][] xLookups, byte[][][] yLookups) { }
+
+        private static final int GENERAL = 0, TABLES_GRAY_TABLES_VIGNETTE = 1, VIGNETTE_TABLES_GRAY_TABLES = 2;
+
+        private final List<FrameProcessor> originals;
+        private final List<Step> steps;
+        private final double flickerPercentageSd;
+
+        private FusedPass(List<FrameProcessor> run, InfoVideo info) throws ReflectiveOperationException {
+            this.originals = run;
+            this.videoInfo = info;
+            this.flickerPercentageSd = (double) readStatic(FrameFlickerer.class, "FLICKER_PERCENTAGE_SD");
+            List<Step> built = new ArrayList<>();
+            for (FrameProcessor effect : run) {
+                Class<?> type = effect.getClass();
+                if (type == FrameFlickerer.class) {
+                    built.add(new FlickerStep((int) read(effect, "mediaSeed")));
+                } else if (type == FrameBlackAndWhiter.class) {
+                    built.add(new GrayStep());
+                } else if (type == FrameYellower.class) {
+                    built.add(new LutStep((byte[]) read(effect, "blueLookup"), (byte[]) read(effect, "greenLookup"),
+                            (byte[]) read(effect, "redLookup")));
+                } else {
+                    built.add(new VignetteStep((byte[][]) read(effect, "xLookups"), (byte[][]) read(effect, "yLookups")));
+                }
+            }
+            this.steps = List.copyOf(built);
+        }
+
+        static List<FrameProcessor> fuse(List<FrameProcessor> chain, InfoVideo info) {
+            if (info.imageChannels() != 3
+                    || (info.imageDepth() != Frame.DEPTH_UBYTE && info.imageDepth() != Frame.DEPTH_BYTE)) {
+                return List.copyOf(chain);
+            }
+
+            List<FrameProcessor> result = new ArrayList<>();
+            List<FrameProcessor> run = new ArrayList<>();
+            try {
+                for (FrameProcessor effect : chain) {
+                    if (isFusable(effect)) {
+                        run.add(effect);
+                    } else {
+                        endRun(run, result, info);
+                        result.add(effect);
+                    }
+                }
+                endRun(run, result, info);
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                System.out.println("Effect fusion unavailable (" + e + "), running the effects as separate passes.");
+                return List.copyOf(chain);
+            }
+
+            if (result.size() < chain.size()) {
+                System.out.println("Effects: " + chain.size() + " run as " + result.size() + " passes (neighbouring "
+                        + "per-pixel effects fused).");
+            }
+            return List.copyOf(result);
+        }
+
+        private static void endRun(List<FrameProcessor> run, List<FrameProcessor> result, InfoVideo info)
+                throws ReflectiveOperationException {
+            if (run.size() >= 2) {
+                result.add(new FusedPass(List.copyOf(run), info));
+            } else {
+                result.addAll(run);
+            }
+            run.clear();
+        }
+
+        private static boolean isFusable(FrameProcessor effect) {
+            Class<?> type = effect.getClass();
+            return type == FrameFlickerer.class || type == FrameBlackAndWhiter.class
+                    || type == FrameYellower.class || type == FrameVignetter.class;
+        }
+
+        @Override
+        public void process(Frame frame, InfoFrame info) throws Exception {
+            if (frame.image == null || frame.image.length == 0 || !(frame.image[0] instanceof ByteBuffer pixels)) {
+                for (FrameProcessor effect : originals) {
+                    effect.process(frame, info);
+                }
+                return;
+            }
+
+            Program program = resolve(info.frameNumber());
+            int width = videoInfo.imageWidth();
+            int height = videoInfo.imageHeight();
+            int stride = videoInfo.imageStride();
+            int widthBytes = width * 3;
+            int count = program.count();
+            byte[] row = new byte[widthBytes];
+
+            for (int y = 0; y < height; y++) {
+                int rowStart = y * stride;
+                pixels.get(rowStart, row, 0, widthBytes);
+
+                switch (program.shape()) {
+                    case TABLES_GRAY_TABLES_VIGNETTE -> tablesGrayTablesVignette(row, widthBytes, program,
+                            program.yLookups()[3][y]);
+                    case VIGNETTE_TABLES_GRAY_TABLES -> vignetteTablesGrayTables(row, widthBytes, program,
+                            program.yLookups()[0][y]);
+                    default -> {
+                        for (int k = 0; k < count; k++) {
+                            switch (program.kind()[k]) {
+                                case LUT -> applyTables(row, widthBytes, program.blue()[k], program.green()[k],
+                                        program.red()[k]);
+                                case VIGNETTE -> applyVignette(row, widthBytes, program.xLookups()[k],
+                                        program.yLookups()[k][y]);
+                                default -> applyGray(row, widthBytes);
+                            }
+                        }
+                    }
+                }
+
+                pixels.put(rowStart, row, 0, widthBytes);
+            }
+        }
+
+        private static void tablesGrayTablesVignette(byte[] row, int length, Program p, byte[] yLookup) {
+            byte[] firstBlue = p.blue()[0], firstGreen = p.green()[0], firstRed = p.red()[0];
+            byte[] lastBlue = p.blue()[2], lastGreen = p.green()[2], lastRed = p.red()[2];
+            byte[][] xLookups = p.xLookups()[3];
+            int x = 0;
+            for (int i = 0; i < length; i += 3, x++) {
+                int b = firstBlue[row[i] & 0xff] & 0xff;
+                int g = firstGreen[row[i + 1] & 0xff] & 0xff;
+                int r = firstRed[row[i + 2] & 0xff] & 0xff;
+                int luminance = (54 * r + 183 * g + 19 * b) / 256;
+                byte[] xLookup = xLookups[x];
+                row[i] = yLookup[xLookup[lastBlue[luminance] & 0xff] & 0xff];
+                row[i + 1] = yLookup[xLookup[lastGreen[luminance] & 0xff] & 0xff];
+                row[i + 2] = yLookup[xLookup[lastRed[luminance] & 0xff] & 0xff];
+            }
+        }
+
+        private static void vignetteTablesGrayTables(byte[] row, int length, Program p, byte[] yLookup) {
+            byte[][] xLookups = p.xLookups()[0];
+            byte[] midBlue = p.blue()[1], midGreen = p.green()[1], midRed = p.red()[1];
+            byte[] lastBlue = p.blue()[3], lastGreen = p.green()[3], lastRed = p.red()[3];
+            int x = 0;
+            for (int i = 0; i < length; i += 3, x++) {
+                byte[] xLookup = xLookups[x];
+                int b = midBlue[yLookup[xLookup[row[i] & 0xff] & 0xff] & 0xff] & 0xff;
+                int g = midGreen[yLookup[xLookup[row[i + 1] & 0xff] & 0xff] & 0xff] & 0xff;
+                int r = midRed[yLookup[xLookup[row[i + 2] & 0xff] & 0xff] & 0xff] & 0xff;
+                int luminance = (54 * r + 183 * g + 19 * b) / 256;
+                row[i] = lastBlue[luminance];
+                row[i + 1] = lastGreen[luminance];
+                row[i + 2] = lastRed[luminance];
+            }
+        }
+
+        private static void applyTables(byte[] row, int length, byte[] blue, byte[] green, byte[] red) {
+            for (int i = 0; i < length; i += 3) {
+                row[i] = blue[row[i] & 0xff];
+                row[i + 1] = green[row[i + 1] & 0xff];
+                row[i + 2] = red[row[i + 2] & 0xff];
+            }
+        }
+
+        private static void applyGray(byte[] row, int length) {
+            for (int i = 0; i < length; i += 3) {
+                int luminance = (54 * (row[i + 2] & 0xff) + 183 * (row[i + 1] & 0xff) + 19 * (row[i] & 0xff)) / 256;
+                byte grey = (byte) luminance;
+                row[i] = grey;
+                row[i + 1] = grey;
+                row[i + 2] = grey;
+            }
+        }
+
+        private static void applyVignette(byte[] row, int length, byte[][] xLookups, byte[] yLookup) {
+            int x = 0;
+            for (int i = 0; i < length; i += 3, x++) {
+                byte[] xLookup = xLookups[x];
+                row[i] = yLookup[xLookup[row[i] & 0xff] & 0xff];
+                row[i + 1] = yLookup[xLookup[row[i + 1] & 0xff] & 0xff];
+                row[i + 2] = yLookup[xLookup[row[i + 2] & 0xff] & 0xff];
+            }
+        }
+
+        private Program resolve(int frameNumber) {
+            int capacity = steps.size();
+            int[] kind = new int[capacity];
+            byte[][] blue = new byte[capacity][];
+            byte[][] green = new byte[capacity][];
+            byte[][] red = new byte[capacity][];
+            byte[][][] xLookups = new byte[capacity][][];
+            byte[][][] yLookups = new byte[capacity][][];
+            int count = 0;
+            byte[] pendingBlue = null;
+            byte[] pendingGreen = null;
+            byte[] pendingRed = null;
+
+            for (Step step : steps) {
+                byte[] tableBlue = null;
+                byte[] tableGreen = null;
+                byte[] tableRed = null;
+                if (step instanceof LutStep lut) {
+                    tableBlue = lut.blue();
+                    tableGreen = lut.green();
+                    tableRed = lut.red();
+                } else if (step instanceof FlickerStep flicker) {
+                    tableBlue = flickerTable(flicker.mediaSeed(), frameNumber);
+                    tableGreen = tableBlue;
+                    tableRed = tableBlue;
+                }
+
+                if (tableBlue != null) {
+                    if (pendingBlue == null) {
+                        pendingBlue = tableBlue;
+                        pendingGreen = tableGreen;
+                        pendingRed = tableRed;
+                    } else {
+                        pendingBlue = compose(pendingBlue, tableBlue);
+                        pendingGreen = compose(pendingGreen, tableGreen);
+                        pendingRed = compose(pendingRed, tableRed);
+                    }
+                    continue;
+                }
+
+                if (pendingBlue != null) {
+                    kind[count] = LUT;
+                    blue[count] = pendingBlue;
+                    green[count] = pendingGreen;
+                    red[count] = pendingRed;
+                    count++;
+                    pendingBlue = null;
+                    pendingGreen = null;
+                    pendingRed = null;
+                }
+
+                if (step instanceof VignetteStep vignette) {
+                    kind[count] = VIGNETTE;
+                    xLookups[count] = vignette.xLookups();
+                    yLookups[count] = vignette.yLookups();
+                } else {
+                    kind[count] = GRAY;
+                }
+                count++;
+            }
+
+            if (pendingBlue != null) {
+                kind[count] = LUT;
+                blue[count] = pendingBlue;
+                green[count] = pendingGreen;
+                red[count] = pendingRed;
+                count++;
+            }
+            return new Program(count, shapeOf(count, kind), kind, blue, green, red, xLookups, yLookups);
+        }
+
+        private static int shapeOf(int count, int[] kind) {
+            if (count == 4 && kind[0] == LUT && kind[1] == GRAY && kind[2] == LUT && kind[3] == VIGNETTE) {
+                return TABLES_GRAY_TABLES_VIGNETTE;
+            }
+            if (count == 4 && kind[0] == VIGNETTE && kind[1] == LUT && kind[2] == GRAY && kind[3] == LUT) {
+                return VIGNETTE_TABLES_GRAY_TABLES;
+            }
+            return GENERAL;
+        }
+
+        private static byte[] compose(byte[] first, byte[] second) {
+            byte[] combined = new byte[256];
+            for (int value = 0; value < 256; value++) {
+                combined[value] = second[first[value] & 0xff];
+            }
+            return combined;
+        }
+
+        private byte[] flickerTable(int mediaSeed, int frameNumber) {
+            Random random = new Random((long) mediaSeed + frameNumber);
+            double dimmingPercentage = Math.abs(random.nextGaussian()) * flickerPercentageSd;
+            double brightnessScale = Math.max(0.0, 100.0 - dimmingPercentage) / 100.0;
+            byte[] table = new byte[256];
+            for (int value = 0; value < table.length; value++) {
+                table[value] = (byte) Math.max(0, Math.min(255, (int) Math.round(value * brightnessScale)));
+            }
+            return table;
+        }
+
+        private static Object read(Object owner, String fieldName) throws ReflectiveOperationException {
+            Field field = owner.getClass().getDeclaredField(fieldName);
+            field.setAccessible(true);
+            return field.get(owner);
+        }
+
+        private static Object readStatic(Class<?> owner, String fieldName) throws ReflectiveOperationException {
+            Field field = owner.getDeclaredField(fieldName);
+            field.setAccessible(true);
+            return field.get(null);
+        }
     }
 
     private record PreparedFrame(

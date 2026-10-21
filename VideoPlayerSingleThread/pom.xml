@@ -44,6 +44,15 @@
 
   <build>
     <plugins>
+    <plugin>
+	    <groupId>org.openjfx</groupId>
+	    <artifactId>javafx-maven-plugin</artifactId>
+	    <configuration>
+	        <options>
+	            <option>-Xlog:gc*:file=gc.log</option>
+	        </options>
+	    </configuration>
+	</plugin>
       <plugin>
         <groupId>org.openjfx</groupId>
         <artifactId>javafx-maven-plugin</artifactId>
