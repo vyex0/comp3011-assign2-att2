@@ -44,15 +44,6 @@
 
   <build>
     <plugins>
-    <plugin>
-	    <groupId>org.openjfx</groupId>
-	    <artifactId>javafx-maven-plugin</artifactId>
-	    <configuration>
-	        <options>
-	            <option>-Xlog:gc*:file=gc.log</option>
-	        </options>
-	    </configuration>
-	</plugin>
       <plugin>
         <groupId>org.openjfx</groupId>
         <artifactId>javafx-maven-plugin</artifactId>
@@ -62,6 +53,8 @@
             <options>
                 <option>--enable-native-access=javafx.graphics</option>
                 <option>--enable-native-access=ALL-UNNAMED</option>
+                <option>-Xlog:gc*:file=gc.log</option>
+	            <option>-Dvideoplayer.profile=true</option>
             </options>
         </configuration>
       </plugin>
