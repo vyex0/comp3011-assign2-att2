@@ -1,8 +1,8 @@
 /**
  * New file for Adelaide University COMP3011 Assignment 2.
- * 
- * 1. Vanessa Soetjiadi, a1945309
- * 
+ *
+ * Authors:
+ *   1. Vanessa Soetjiadi, a1945309
  */
  
 package comp3011;

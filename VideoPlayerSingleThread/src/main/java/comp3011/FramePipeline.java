@@ -1,10 +1,8 @@
 /**
  * New file for Adelaide University COMP3011 Assignment 2.
- * 
- * 1. Vanessa Soetjiadi, a1945309
- * 
- * Extracted from VideoPlayerModel, where the decoder thread, effects worker pool, in-flight queue and stop logic
- * were mixed in with the playback clock, audio scheduling and seeking.
+ *
+ * Authors:
+ *   1. Vanessa Soetjiadi, a1945309
  */
 
 package comp3011;

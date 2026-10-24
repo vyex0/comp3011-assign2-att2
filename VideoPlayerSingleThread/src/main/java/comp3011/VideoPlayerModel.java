@@ -649,6 +649,16 @@ public class VideoPlayerModel {
      * which is what keeps the (not thread-safe) grabber confined to one thread. It does the work that has to be done
      * in order on that thread (grab, queue the audio, time the frame, copy it so the grabber can reuse its buffer),
      * and hands back the part that can run in parallel on a worker: apply the effects and convert for display.
+     * 
+     * <p>
+     * <b>Why this is implemented here and not in FramePipeline.</b> This work needs the player's own state: the
+     * grabber, the audio queue, the playback clock, the effect chain, the frame pool and the worker converter. As an
+     * inner class of the player, it can use all of them directly. {@code FramePipeline} is generic: it only knows how
+     * to ask a {@code FrameSource} for the next piece of work, then run it, keep the results in order and limit how
+     * far the decoder runs ahead. It knows nothing about FFmpeg, audio or effects. Keeping the video-specific code
+     * here leaves the pipeline reusable and easy to test with a simple fake source. It also means the grabber is
+     * only ever reached through this one class, on the decoder thread.
+     * </p>
      */
     private final class GrabberSource implements FramePipeline.FrameSource<PreparedFrame> {
     	@Override
@@ -729,9 +739,20 @@ public class VideoPlayerModel {
     	}
     }
     
-    // Copies a decoded frame into a spare frame from the pool. The copy is needed because the grabber reuses its
-    // own buffer for the next grab, while a worker is still reading this one. A frame is only created when the
-    // pool is empty or the video's size or format has changed (for example after opening a different file).
+    /**
+     * Copies a decoded frame into a spare frame from the pool. The copy is needed because the grabber reuses its
+     * own buffer for the next grab, while a worker is still reading this one. A frame is only created when the
+     * pool is empty or the video's size or format has changed (for example after opening a different file).
+     * 
+     * <p>
+	 * <b>Why this is useful.</b> The copy lets the decoder thread move straight on to the next frame while a worker
+	 * is still applying effects to this one. Without it, the grabber would overwrite the frame the worker is reading,
+	 * or the decoder would have to wait for the worker to finish, which would remove the benefit of having several
+	 * workers. Taking the copy from a pool, instead of creating a new frame each time, avoids allocating several
+	 * megabytes for every frame. That cuts down on garbage for the garbage collector to clean up, which helps keep
+	 * playback smooth. The worker returns the frame to the pool once it has finished with it (see {@code readNext}).
+	 * </p>
+     */
     private Frame copyIntoPooledFrame(Frame src) {
         Frame dst = framePool.poll();
         if (dst == null

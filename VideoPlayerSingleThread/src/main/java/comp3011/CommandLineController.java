@@ -22,15 +22,11 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * Created in the VideoPlayerApp's main function to receive and parse the video
- * player's command-line arguments.
+ * Created in the VideoPlayerApp's main function to receive and parse the video player's command-line arguments.
  *
  * <p>
- * Extracts the video file and supported launch options, reports invalid input
- * or help text, and exposes the resulting launch configuration via methods to
- * the
- * {@link VideoPlayerApp}.
- * </p>
+ * Extracts the video file and supported launch options, reports invalid input or help text, and exposes the 
+ * resulting launch configuration via methods to the {@link VideoPlayerApp}.
  * 
  * <p>
  * Frame processors (effects) are not named here, they come from {@link FrameProcessorType}, so adding an effect

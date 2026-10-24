@@ -1,8 +1,8 @@
 /**
  * New file for Adelaide University COMP3011 Assignment 2.
- * 
- * 1. Vanessa Soetjiadi, a1945309
- * 
+ *
+ * Authors:
+ *   1. Vanessa Soetjiadi, a1945309
  */
 
 package comp3011;
@@ -57,8 +57,8 @@ public class PlaybackClock {
 	// Everything below is guarded by "lock". Never read or write it outside a synchronized (lock) block.
 	private long firstTimestampUs = NOT_ANCHORED; // The timestamp of the first frame, or NOT_ANCHORED if playback has not started.
 	private long playbackStartNs; // The real-world time when the first frame should be displayed.
-	private long logicalPlaybackBaseUs; // The playback position shown to the user when playback starts or seeks.
 	
+	private long logicalPlaybackBaseUs; // The playback position shown to the user when playback starts or seeks.
 	private boolean pausePending; // True if playback is paused and has not yet resumed.
 	private long pauseStartedNs; // The real-world time when playback was paused.
 	

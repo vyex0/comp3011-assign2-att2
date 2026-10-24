@@ -1,4 +1,4 @@
-/*
+/**
  * New file for Adelaide University COMP3011 Assignment 2.
  *
  * Authors:
@@ -150,7 +150,7 @@ public class PlaybackClockTest {
     void aPauseTakenBeforeTheAnchorExistsDoesNotShiftTheLaterAnchor() {
         clock.reset(0, false, START);
         clock.pause(START + 10);
-        clock.resume(START + 5_000_000L);          // resumed before any frame was decoded
+        clock.resume(START + 5_000_000L); // resumed before any frame was decoded
  
         PlaybackClock.FrameTiming timing = clock.schedule(0, false, START + 6_000_000L);
  
@@ -166,9 +166,9 @@ public class PlaybackClockTest {
     @Test
     void anchoringWhilePausedStartsThePauseAtTheAnchor() {
         clock.reset(0, true, START);
-        clock.schedule(0, true, START + 100);       // first frame decoded while paused
+        clock.schedule(0, true, START + 100); // first frame decoded while paused
  
-        clock.resume(START + 100 + 2_000_000L);     // paused for 2ms since the anchor
+        clock.resume(START + 100 + 2_000_000L); // paused for 2ms since the anchor
  
         assertEquals(START + 100 + PRE_ROLL + 2_000_000L, clock.dueTimeNs(0));
     }

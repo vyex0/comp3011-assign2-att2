@@ -1,9 +1,8 @@
 /**
  * New file for Adelaide University COMP3011 Assignment 2.
- * 
- * 1. Vanessa Soetjiadi, a1945309
- * 
- * Added so the command line has ONE place that knows about every effect (see the class comment).
+ *
+ * Authors:
+ *   1. Vanessa Soetjiadi, a1945309
  */
 package comp3011;
 
