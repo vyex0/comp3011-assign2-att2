@@ -4,9 +4,9 @@
  * Authors:
  *   1. Vanessa Soetjiadi, a1945309
  */
-
+ 
 package comp3011;
-
+ 
 import java.util.Queue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
@@ -20,13 +20,13 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
-
+ 
 /**
  * The player's multi-threaded frame production line: one decoder thread reads frames in order, a pool of effects
  * workers processes several frames at the same time, and the results are handed back, still in order, to the
  * controlling thread (the JavaFX thread in the player).
  */
-
+ 
 public class FramePipeline<T> {
 	/**
 	 * Where frames come from. Implemented by the player around the FFmpeg grabber. Both methods are only ever
@@ -69,6 +69,11 @@ public class FramePipeline<T> {
 	 private final AtomicInteger generation = new AtomicInteger();
 	 private final AtomicBoolean decodeScheduled = new AtomicBoolean(); // true while a decode job is queued or running
 	 private final Queue<Future<T>> inFlight = new ConcurrentLinkedQueue<>();
+	 
+	 // How many worker jobs are currently running (past the stale check, inside the source's job). flush() waits for
+	 // this to reach zero, so nothing from an old run can still be inside an effect when a new run starts.
+	 private final Object activeWorkersLock = new Object();
+	 private int activeWorkers; // guarded by activeWorkersLock
 	 
 	 private volatile boolean endOfStream; // the source has no more frames (queued frames may still be showing)
 	 private volatile long pendingSeekUs = NO_SEEK; // controlling thread writes, decoder reads at the start of a job
@@ -148,8 +153,10 @@ public class FramePipeline<T> {
 		 }
 	 }
 	 
-	 // Runs on the decoder thread. Reads frames and hands each one to a worker until the queue is full, the stream
-	 // ends, or this run becomes stale.
+	 /**
+	  * Runs on the decoder thread. Reads frames and hands each one to a worker until the queue is full, the stream
+	  * ends, or this run becomes stale.
+	  */
 	 private void decodeLoop(int gen, FrameSource<T> src) {
 		 BooleanSupplier cancelled = () -> gen != generation.get();
 		 try {
@@ -169,12 +176,7 @@ public class FramePipeline<T> {
 				 }
 				 
 				 // The decoder moves straight on to the next frame while the worker is still busy with this one.
-				 inFlight.offer(workers.submit(() -> {
-					 if (cancelled.getAsBoolean()) {
-						 throw new CancellationException("stale frame from before a seek/stop");
-					 }
-					 return work.call();
-				 }));
+				 inFlight.offer(workers.submit(() -> runOnWorker(cancelled, work)));
 			 }
 		 } catch (Exception e) {
 			 errorHandler.onDecodeFailure(e, () -> gen == generation.get());
@@ -208,22 +210,74 @@ public class FramePipeline<T> {
 	 }
 	 
 	 /**
-	  * Discards everything in flight and waits until the decoder is idle. Used before a seek, and when closing.
+	  * Discards everything in flight and waits until the decoder is idle AND no effects worker is still running a
+	  * frame from the old run. Used before a seek, and when closing.
+	  *
+	  * <p>
+	  * Waiting for the workers is what lets the caller safely re-initialise the effects afterwards: when this returns,
+	  * no thread is inside an effect, and any job still queued is stale and will refuse to start. The wait is at most
+	  * the time one frame's effects take.
+	  * </p>
 	  */
 	 public void flush() {
 		 generation.incrementAndGet();
 		 awaitDecoderIdle();
 		 for (Future<T> future : inFlight) {
 			 // false: a worker that is already running a frame cannot be interrupted usefully (effects are plain
-			 // loops), so let it finish; its result is dropped, and queued tasks refuse to start (they are stale).
+			 // loops), so it is left to finish and awaitWorkersIdle() below waits for it. Its result is dropped, and
+			 // queued jobs refuse to start (they are stale).
 			 future.cancel(false);
 		 }
 		 inFlight.clear();
+		 awaitWorkersIdle();
 		 endOfStream = false;
 	 }
 	 
-	 // Anything queued on the single decoder thread runs in order, so when this empty job completes every earlier
-	 // decode job (including one that was already running) has finished: it is a barrier.s
+	 /**
+	  * Runs on an effects worker. The job is counted as active BEFORE the stale check, and the count only drops when
+	  * the job has completely finished. That order is what makes {@link #awaitWorkersIdle} reliable: a job that
+	  * passed the stale check before a flush began is always counted by the time the flush looks, and a job that
+	  * starts after the flush began sees the new generation, is refused, and never touches an effect.
+	  */
+	 private T runOnWorker(BooleanSupplier cancelled, Callable<T> work) throws Exception {
+		 synchronized (activeWorkersLock) {
+			 activeWorkers++;
+		 }
+		 try {
+			 if (cancelled.getAsBoolean()) {
+				 throw new CancellationException("stale frame from before a seek/stop");
+			 }
+			 return work.call();
+		 } finally {
+			 synchronized (activeWorkersLock) {
+				 if (--activeWorkers == 0) {
+					 activeWorkersLock.notifyAll();
+				 }
+			 }
+		 }
+	 }
+	 
+	 /**
+	  * Waits until no worker is inside a job. Workers never wait for the controlling thread, and a job only runs the
+	  * effects on one frame, so the wait is short (at most one frame's effects) and cannot form a cycle.
+	  */
+	 private void awaitWorkersIdle() {
+		 synchronized (activeWorkersLock) {
+			 while (activeWorkers > 0) {
+				 try {
+					 activeWorkersLock.wait();
+				 } catch (InterruptedException e) {
+					 Thread.currentThread().interrupt();
+					 return;
+				 }
+			 }
+		 }
+	 }
+	 
+	 /**
+	  * Anything queued on the single decoder thread runs in order, so when this empty job completes every earlier
+	  * decode job (including one that was already running) has finished: it is a barrier.s
+	  */
 	 private void awaitDecoderIdle() {
 		 try {
 			 decoder.submit(() -> { }).get();
@@ -249,8 +303,10 @@ public class FramePipeline<T> {
         workers.shutdownNow();
 	 }
 	 
-	// Names each thread (so it is recognisable in a debugger or thread dump) and marks it as a daemon thread, which
-    // does not keep the JVM alive: the application can still exit when the window closes.
+	/**
+	 * Names each thread (so it is recognisable in a debugger or thread dump) and marks it as a daemon thread, which
+	 * does not keep the JVM alive: the application can still exit when the window closes.
+	 */
     private static ThreadFactory daemonThreads(String name) {
         AtomicInteger count = new AtomicInteger();
         return runnable -> {

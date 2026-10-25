@@ -225,10 +225,15 @@ public class FramePipelineTest {
 	 * Needed because this is the hardest case for a multithreaded design: a worker can still be running on a frame
 	 * from before the seek when the new frames start arriving. The old frames are made numerically different
 	 * ({@code 1000 + n}) so that if one leaks into the output it shows up as an obviously wrong value instead of
-	 * hiding among the expected 0 to 4. A {@link CountDownLatch} holds the old workers inside their job until the
-	 * flush has happened, which makes the "finished too late" timing certain rather than dependent on luck, and
-	 * is why the test does not rely on sleeping. The pipeline is checked to be full first, so we know there really
-	 * are frames in flight to discard.
+	 * hiding among the expected 0 to 4. A {@link CountDownLatch} holds the old workers inside their job while the flush
+	 * starts, which makes the overlap certain rather than dependent on luck, and is why the test does not rely on
+	 * sleeping. The pipeline is checked to be full first, so we know there really are frames in flight to discard.
+	 * </p>
+	 *
+	 * <p>
+	 * {@code flush()} waits for workers that are already running a frame (see
+	 * {@link #flushWaitsForAWorkerThatIsStillRunningAFrame}), so it is called on its own thread here and the old
+	 * workers are released while it waits. Their results are produced but must be thrown away.
 	 * </p>
 	 */
 	@Test
@@ -244,11 +249,55 @@ public class FramePipelineTest {
             pipeline.requestDecoding();
             await(() -> old.reads.get() == pipeline.maxFramesInFlight(), "the old frames to be in flight");
             
-            pipeline.flush();
-            pipeline.begin(new FakeSource(5, n -> () -> n));
-            release.countDown(); // the old frames now finish, too late to matter
+            Thread flusher = new Thread(pipeline::flush, "test-flusher");
+            flusher.start();
+            release.countDown(); // the old frames finish while the flush is waiting; their results must be dropped
+            flusher.join(TimeUnit.SECONDS.toMillis(10));
+            assertFalse(flusher.isAlive(), "flush never returned after the old workers finished");
             
+            pipeline.begin(new FakeSource(5, n -> () -> n));
             assertEquals(List.of(0, 1, 2, 3, 4), drain(pipeline));
+		} finally {
+			pipeline.close();
+		}
+	}
+	
+	/**
+	 * Test that {@code flush()} does not return while an effects worker is still inside a frame from the old run.
+	 *
+	 * <p>
+	 * Needed because the caller re-initialises the effects after a flush. If a worker from the old run were still
+	 * running an effect at that moment, it would be reading the effect's tables while they are rebuilt. The worker is
+	 * held inside its job with latches, so the test does not depend on timing to get a worker into that state. The
+	 * check that flush is still waiting can only wrongly pass (if the machine is slow and flush is simply late),
+	 * never wrongly fail, so it cannot make the test flaky; a pipeline that does not wait fails it every time.
+	 * </p>
+	 */
+	@Test
+	void flushWaitsForAWorkerThatIsStillRunningAFrame() throws Exception {
+		FramePipeline<Integer> pipeline = new FramePipeline<>(1, IGNORE_ERRORS);
+		try {
+			CountDownLatch insideJob = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			pipeline.begin(new FakeSource(1, n -> () -> {
+				insideJob.countDown();
+				release.await();
+				return n;
+			}));
+			pipeline.requestDecoding();
+			assertTrue(insideJob.await(10, TimeUnit.SECONDS), "the worker to start the frame");
+			
+			CountDownLatch flushed = new CountDownLatch(1);
+			Thread flusher = new Thread(() -> {
+				pipeline.flush();
+				flushed.countDown();
+			}, "test-flusher");
+			flusher.start();
+			
+			assertFalse(flushed.await(200, TimeUnit.MILLISECONDS),
+					"flush returned while a worker was still inside a frame from the old run");
+			release.countDown();
+			assertTrue(flushed.await(10, TimeUnit.SECONDS), "flush never returned after the worker finished");
 		} finally {
 			pipeline.close();
 		}

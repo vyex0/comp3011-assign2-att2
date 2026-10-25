@@ -1,10 +1,14 @@
 /*
  * Starter code supplied for Adelaide University COMP3011 Assignment 2.
  * Students are free to modify this file for assessment purposes.
- * 
+ *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Vanessa Soetjiadi, a1945309
+ *
+ * Modifications (Vanessa Soetjiadi):
+ * - Documented the thread-safety contract that effects must follow, because process() now runs
+ *   on several effects worker threads at the same time.
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -27,6 +31,20 @@ import org.bytedeco.javacv.Frame;
  * determination of accurately applied effects in the correct order free of any race
  * conditions, frame overwrites or frame tearing etc. Some helper methods are provided
  * for this.
+ * </p>
+ * 
+ * <p>
+ * <b>Thread-safety contract.</b> After {@link #initialise} has finished, {@link #process} can be called on the
+ * same processor object by several effects worker threads at once, each on a different frame. So:
+ * </p>
+ * <ul>
+ * <li>{@code process()} must not write instance fields. Everything it needs is built in {@code initialise()}.</li>
+ * <li>Per-frame scratch space is a local variable or a {@link ThreadLocal}, never a plain shared field.</li>
+ * <li>Anything built lazily is built completely first, then published with one {@code volatile} write
+ * (see {@code FrameMottler}).</li>
+ * </ul>
+ * <p>
+ * {@code EffectsConcurrencyTest} checks every effect in {@link FrameProcessorType} against this contract.
  * </p>
  */
 public abstract class FrameProcessor {
